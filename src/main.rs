@@ -5,17 +5,17 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
-use std::collections::HashSet;
 use rand::Rng;
 use clap::{App, Arg};
 use serde::{Serialize, Deserialize};
 use serde_json::{Value, json};
 use chrono::{DateTime, Utc};
 
-// Packet types for synchronization
+// Packet types
 const PACKET_TYPE_SYNC: u8 = 1;
 const PACKET_TYPE_SYNC_ACK: u8 = 2;
 const PACKET_TYPE_DATA: u8 = 3;
+const PACKET_TYPE_TERMINATE: u8 = 4; // New packet type for clean termination
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct PacketStats {
@@ -28,8 +28,9 @@ struct PacketStats {
     total_rtt_ms: f64,
     timestamp: DateTime<Utc>,
     loss_percent: f64,
-    expected_next_seq: u64,  // New field for tracking next expected sequence number
-    detected_lost_packets: u64, // New field for tracking specific lost packets
+    expected_next_seq: u64,
+    detected_lost_packets: u64,
+    total_rtt_samples: u64, // Track number of RTT samples for better averaging
 }
 
 impl PacketStats {
@@ -44,8 +45,9 @@ impl PacketStats {
             total_rtt_ms: 0.0,
             timestamp: Utc::now(),
             loss_percent: 0.0,
-            expected_next_seq: 0, // Start expecting sequence #0
+            expected_next_seq: 0,
             detected_lost_packets: 0,
+            total_rtt_samples: 0,
         }
     }
 
@@ -69,18 +71,18 @@ impl PacketStats {
         }
 
         self.total_rtt_ms += rtt_ms;
+        self.total_rtt_samples += 1;
         self.update_avg_rtt();
     }
 
     fn update_avg_rtt(&mut self) {
-        if self.received > 0 {
-            self.avg_rtt_ms = Some(self.total_rtt_ms / self.received as f64);
+        if self.total_rtt_samples > 0 {
+            self.avg_rtt_ms = Some(self.total_rtt_ms / self.total_rtt_samples as f64);
         } else {
             self.avg_rtt_ms = None;
         }
     }
 
-    // New method to process received sequence number and detect lost packets
     fn process_sequence(&mut self, seq_num: u64) {
         // If this is the first packet, initialize expected sequence
         if self.received == 0 {
@@ -108,10 +110,8 @@ impl PacketStats {
     }
 
     fn update_loss_stats(&mut self) {
-        // Use detected lost packets instead of simple subtraction
         self.lost = self.detected_lost_packets;
         
-        // Calculate loss percentage based on received + lost packets
         let total_expected = self.received + self.lost;
         if total_expected > 0 {
             self.loss_percent = self.lost as f64 / total_expected as f64 * 100.0;
@@ -200,7 +200,7 @@ fn export_to_csv(stats: &PacketStats, csv_file: &str, header_needed: bool) -> st
 
 // Function to save final statistics before exit
 fn save_final_stats(stats: &PacketStats, json_file: Option<&str>, csv_file: Option<&str>) -> std::io::Result<()> {
-    println!("\n=== SAVING FINAL STATISTICS BEFORE EXIT ===");
+    println!("=== SAVING FINAL STATISTICS BEFORE EXIT ===");
     
     if let Some(file) = json_file {
         if let Err(e) = export_to_json(stats, file) {
@@ -277,33 +277,35 @@ impl Spinner {
     }
 }
 
-// Generate a progress bar
-fn progress_bar(percent: f64, width: usize) -> String {
-    let filled_width = ((percent / 100.0) * width as f64) as usize;
-    let empty_width = width.saturating_sub(filled_width);
+// Send a terminate packet to the remote endpoint
+fn send_terminate_packet(socket: &UdpSocket, remote_addr: &SocketAddr) -> std::io::Result<()> {
+    let mut packet = Vec::with_capacity(16);
+    packet.push(PACKET_TYPE_TERMINATE);
     
-    let filled = "█".repeat(filled_width);
-    let empty = "░".repeat(empty_width);
-    
-    format!("[{}{}] {:.1}%", filled, empty, percent)
+    // Try to send the terminate packet multiple times for reliability
+    for _ in 0..5 {
+        if let Err(e) = socket.send_to(&packet, remote_addr) {
+            eprintln!("Failed to send terminate packet: {}", e);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
 }
 
-// Function to clear a line and print fixed-width content
-fn print_fixed_line(content: &str, width: usize) {
-    // Ensure content is exactly width characters
-    let content_len = content.chars().count();
-    if content_len < width {
-        print!("{}{}", content, " ".repeat(width - content_len));
-    } else if content_len > width {
-        print!("{}", &content[..width]);
-    } else {
-        print!("{}", content);
-    }
+// Execute clean shutdown procedure
+fn clean_shutdown(stats: &PacketStats, json_file: Option<&str>, csv_file: Option<&str>) -> std::io::Result<()> {
+    println!("\nReceived termination signal, preparing to exit...");
+    
+    // Save final statistics
+    save_final_stats(stats, json_file, csv_file)?;
+    
+    println!("Exiting UDP Monitor. Goodbye!");
+    std::process::exit(0);
 }
 
 fn main() -> std::io::Result<()> {
     let matches = App::new("UDP Monitor")
-        .version("1.1")
+        .version("1.2")
         .author("UDP Monitor Tool")
         .about("Sends and monitors UDP packets")
         .arg(Arg::with_name("local")
@@ -378,32 +380,17 @@ fn main() -> std::io::Result<()> {
     let csv_file = matches.value_of("csv");
 
     // Initialize display
-    println!("UDP Monitor v1.1 - Starting...");
+    println!("UDP Monitor v1.2 - Starting...");
     println!("Local: {}, Remote: {}", local_addr, remote_addr);
     println!("Press Ctrl+C to exit and save statistics");
     println!();
     
-    // Print static header for status updates
-    println!("┌─────────────────┬───────────────┬────────────────┬─────────────────┐");
-    println!("│ ACTIVITY        │ PACKETS       │ RTT (ms)       │ STATUS          │");
-    println!("├─────────────────┼───────────────┼────────────────┼─────────────────┤");
-    println!("│                 │               │                │                 │");
-    println!("│                 │               │                │                 │");
-    println!("│                 │               │                │                 │");
-    println!("├─────────────────┴───────────────┴────────────────┴─────────────────┤");
-    println!("│ Last sent:     -                                                   │");
-    println!("│ Last received: -                                                   │");
-    println!("└───────────────────────────────────────────────────────────────────┘");
-    println!("Sequence-based loss detection: ENABLED");
-    println!();
-    
-    // Move cursor back up to status area
-    for _ in 0..12 {
-        print!("\x1B[A");
-    }
+    // Clear screen and move cursor to top
+    print!("\x1B[2J\x1B[H");
     io::stdout().flush().unwrap();
 
     let socket = UdpSocket::bind(local_addr)?;
+    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     
     if let Some(file) = json_file {
         // Initialize JSON file with an empty array if it doesn't exist
@@ -434,16 +421,20 @@ fn main() -> std::io::Result<()> {
     // Flag to signal synchronized start
     let synchronized = Arc::new(AtomicBool::new(!enable_sync));
     
-    // Setup Ctrl+C handler
+    // Setup clean termination signal
+    let terminate_socket = Arc::clone(&socket);
+    let terminate_remote = remote_addr.clone();
     let r = running.clone();
     let final_stats = stats.clone();
     let json_path = json_file.map(|s| s.to_string());
     let csv_path = csv_file.map(|s| s.to_string());
     
     ctrlc::set_handler(move || {
-        println!("\n\n\n\n\n\n\n\n\n\n\n\n"); // Move past the status area
-        println!("\nReceived Ctrl+C signal, preparing to exit...");
+        println!("\nReceived Ctrl+C signal, notifying remote side...");
         r.store(false, Ordering::SeqCst);
+        
+        // Send termination packet to the remote side
+        let _ = send_terminate_packet(&terminate_socket, &terminate_remote);
         
         // Give some time for threads to notice the termination signal
         thread::sleep(Duration::from_millis(500));
@@ -473,8 +464,8 @@ fn main() -> std::io::Result<()> {
             
             // Display sync status
             let mut stdout = io::stdout();
-            print!("\x1B[4;1H");
-            print!("│ ⏳ Waiting       │               │                │ Synchronizing... │");
+            print!("\x1B[H"); // Move to top
+            print!("⏳ Synchronizing: Waiting for connection...");
             let _ = stdout.flush();
             
             while !sync_received && start_time.elapsed() < Duration::from_secs(sync_timeout) && sync_running.load(Ordering::SeqCst) {
@@ -517,8 +508,8 @@ fn main() -> std::io::Result<()> {
                 }
                 
                 // Update sync status every second
-                print!("\x1B[4;1H");
-                print!("│ ⏳ {:02}s/{:02}s      │               │                │ Synchronizing... │",
+                print!("\x1B[H"); // Move to top
+                print!("⏳ Synchronizing: {:02}s/{:02}s... Waiting for connection", 
                        start_time.elapsed().as_secs(), sync_timeout);
                 let _ = stdout.flush();
                 
@@ -527,20 +518,20 @@ fn main() -> std::io::Result<()> {
             
             // Mark as synchronized or timed out
             if sync_received {
-                print!("\x1B[4;1H");
-                print!("│ ✓ Connected     │               │                │ Starting...     │");
+                print!("\x1B[H"); // Move to top
+                print!("✓ Connection established! Starting...");
                 let _ = stdout.flush();
                 sync_status.store(true, Ordering::SeqCst);
                 
                 // Brief pause before starting
                 thread::sleep(Duration::from_secs(1));
             } else if !sync_running.load(Ordering::SeqCst) {
-                print!("\x1B[4;1H");
-                print!("│ ✗ Aborted       │               │                │ Cancelled       │");
+                print!("\x1B[H"); // Move to top
+                print!("✗ Synchronization aborted");
                 let _ = stdout.flush();
             } else {
-                print!("\x1B[4;1H");
-                print!("│ ✗ Timeout       │               │                │ Starting anyway │");
+                print!("\x1B[H"); // Move to top
+                print!("✗ Synchronization timed out - starting anyway");
                 let _ = stdout.flush();
                 sync_status.store(true, Ordering::SeqCst);
                 
@@ -553,12 +544,17 @@ fn main() -> std::io::Result<()> {
         sync_handle.join().unwrap();
     }
 
+    // Clear screen again after sync
+    print!("\x1B[2J\x1B[H");
+    io::stdout().flush().unwrap();
+
     // Sender thread
     let sender_socket = Arc::clone(&socket);
     let sender_stats = Arc::clone(&stats);
     let sender_activity = Arc::clone(&activity);
     let sender_running = Arc::clone(&running);
     let sender_sync = Arc::clone(&synchronized);
+    let sender_remote = remote_addr.clone();
     
     let sender_handle = thread::spawn(move || {
         let mut rng = rand::thread_rng();
@@ -594,7 +590,7 @@ fn main() -> std::io::Result<()> {
                 remaining -= chunk_size;
             }
 
-            if let Err(e) = sender_socket.send_to(&packet, &remote_addr) {
+            if let Err(e) = sender_socket.send_to(&packet, &sender_remote) {
                 eprintln!("Failed to send packet: {}", e);
             } else {
                 // Update activity tracker
@@ -606,6 +602,14 @@ fn main() -> std::io::Result<()> {
             }
 
             seq_num += 1;
+            
+            // Check if we've reached the packet count limit
+            if count > 0 && sent_count >= count {
+                println!("\nPacket count limit reached, notifying remote side...");
+                sender_running.store(false, Ordering::SeqCst);
+                send_terminate_packet(&sender_socket, &sender_remote).unwrap();
+                break;
+            }
             
             // Check if we should exit before sleeping
             if !sender_running.load(Ordering::SeqCst) {
@@ -621,6 +625,9 @@ fn main() -> std::io::Result<()> {
     let receiver_stats = Arc::clone(&stats);
     let receiver_activity = Arc::clone(&activity);
     let receiver_running = Arc::clone(&running);
+    let receiver_remote = remote_addr.clone();
+    let json_path_recv = json_file.map(|s| s.to_string());
+    let csv_path_recv = csv_file.map(|s| s.to_string());
     
     let receiver_handle = thread::spawn(move || {
         let mut buf = [0; 2048];
@@ -634,46 +641,70 @@ fn main() -> std::io::Result<()> {
                     if size >= 1 {  // At least 1 byte for packet type
                         let packet_type = buf[0];
                         
-                        // Only process DATA packets in the receiver loop
-                        if packet_type == PACKET_TYPE_DATA && size >= 17 {  // type + seq + timestamp
-                            // Extract seq_num and timestamp
-                            let mut seq_bytes = [0u8; 8];
-                            seq_bytes.copy_from_slice(&buf[1..9]);
-                            let seq_num = u64::from_be_bytes(seq_bytes);
+                        match packet_type {
+                            PACKET_TYPE_DATA if size >= 17 => { // type + seq + timestamp
+                                // Extract seq_num and timestamp
+                                let mut seq_bytes = [0u8; 8];
+                                seq_bytes.copy_from_slice(&buf[1..9]);
+                                let seq_num = u64::from_be_bytes(seq_bytes);
+                                
+                                let mut ts_bytes = [0u8; 8];
+                                ts_bytes.copy_from_slice(&buf[9..17]);
+                                let send_timestamp = u64::from_be_bytes(ts_bytes);
+                                
+                                // Calculate current time in milliseconds
+                                let current_time = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .expect("Time went backwards")
+                                    .as_millis() as u64;
+                                
+                                // Improved RTT calculation
+                                // On some systems, clock synchronization might be an issue
+                                // Use a safer calculation that works across platforms
+                                let rtt_ms = if current_time >= send_timestamp {
+                                    current_time - send_timestamp
+                                } else {
+                                    // If timestamps are out of sync or there's system clock difference
+                                    // Just use a reasonable default
+                                    50 // 50ms minimum RTT - more realistic than 10ms
+                                };
+                                
+                                let rtt = Duration::from_millis(rtt_ms);
+                                
+                                // Update activity tracker
+                                receiver_activity.lock().unwrap().update_received(seq_num, rtt_ms);
+                                
+                                let mut stats = receiver_stats.lock().unwrap();
+                                // Process sequence number to detect lost packets
+                                stats.process_sequence(seq_num);
+                                stats.update_rtt(rtt);
+                                stats.update_loss_stats();
+                            },
                             
-                            let mut ts_bytes = [0u8; 8];
-                            ts_bytes.copy_from_slice(&buf[9..17]);
-                            let send_timestamp = u64::from_be_bytes(ts_bytes);
+                            PACKET_TYPE_TERMINATE => {
+                                // Received terminate packet, initiate clean shutdown
+                                println!("\nReceived termination signal from remote side...");
+                                receiver_running.store(false, Ordering::SeqCst);
+                                
+                                // Save stats and exit
+                                let stats_guard = receiver_stats.lock().unwrap();
+                                let _ = save_final_stats(
+                                    &stats_guard, 
+                                    json_path_recv.as_deref(),
+                                    csv_path_recv.as_deref()
+                                );
+                                
+                                println!("Exiting UDP Monitor. Goodbye!");
+                                std::process::exit(0);
+                            },
                             
-                            // Calculate current time in milliseconds
-                            let current_time = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .expect("Time went backwards")
-                                .as_millis() as u64;
-                            
-                            // Ensure RTT is calculated correctly
-                            let rtt_ms = if current_time > send_timestamp {
-                                current_time - send_timestamp
-                            } else {
-                                10 // Minimum 10ms RTT to avoid unrealistic values
-                            };
-                            
-                            let rtt = Duration::from_millis(rtt_ms);
-                            
-                            // Update activity tracker
-                            receiver_activity.lock().unwrap().update_received(seq_num, rtt_ms);
-                            
-                            let mut stats = receiver_stats.lock().unwrap();
-                            // Process sequence number to detect lost packets
-                            stats.process_sequence(seq_num);
-                            stats.update_rtt(rtt);
-                            stats.update_loss_stats();
+                            // Sync packets are handled in the sync thread
+                            _ => {}
                         }
-                        // Sync packets are handled in the sync thread
                     }
                 },
                 Err(e) => {
-                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                    if e.kind() != std::io::ErrorKind::WouldBlock && e.kind() != std::io::ErrorKind::TimedOut {
                         eprintln!("Failed to receive: {}", e);
                     }
                     // Small sleep to avoid CPU spinning on non-blocking socket
@@ -713,113 +744,85 @@ fn main() -> std::io::Result<()> {
                 last_activity_data = activity_guard.clone();
             }
             
-            // Update the display
+            // Update the display - now in row format with no borders
             {
                 let mut stdout = io::stdout();
                 
-                // Move to row 4, col 1 (first data row)
-                print!("\x1B[4;1H");
+                // Move to top of screen and clear
+                print!("\x1B[H\x1B[2J");
                 
-                // Line 1: Activity spinner and timestamp
-                print!("│ {} {:15} │", spinner.next(), stats_snapshot.timestamp.format("%H:%M:%S"));
+                // Title and status row
+                let timestamp = stats_snapshot.timestamp.format("%H:%M:%S").to_string();
+                println!("UDP Monitor Status at {} {}", timestamp, spinner.next());
+                println!("{}", "-".repeat(80));
                 
-                // Line 1: Packet stats
-                print!(" {:5}/{:<7} │", stats_snapshot.received, stats_snapshot.sent);
+                // Packets row
+                println!("Packets:  Sent: {}  Received: {}  Lost: {} ({}%)", 
+                         stats_snapshot.sent, stats_snapshot.received, 
+                         stats_snapshot.lost, format!("{:.1}", stats_snapshot.loss_percent));
                 
-                // Line 1: RTT stats
-                if let Some(avg) = stats_snapshot.avg_rtt_ms {
-                    print!(" Avg: {:7.1} ms │", avg);
+                // RTT row
+                let min_rtt = stats_snapshot.min_rtt_ms.map_or("N/A".to_string(), |v| format!("{:.1} ms", v));
+                let avg_rtt = stats_snapshot.avg_rtt_ms.map_or("N/A".to_string(), |v| format!("{:.1} ms", v));
+                let max_rtt = stats_snapshot.max_rtt_ms.map_or("N/A".to_string(), |v| format!("{:.1} ms", v));
+                
+                println!("RTT:      Min: {}  Avg: {}  Max: {}", min_rtt, avg_rtt, max_rtt);
+                
+                // Rate and completion row
+                let uptime_secs = start_time.elapsed().as_secs_f64().max(1.0);
+                let packets_per_sec = stats_snapshot.sent as f64 / uptime_secs;
+                
+                let progress_info = if count > 0 {
+                    let progress = (stats_snapshot.sent as f64 / count as f64) * 100.0;
+                    format!("Progress: {:.1}% complete", progress)
                 } else {
-                    print!(" Avg: ------- ms │");
-                }
+                    "Running continuously".to_string()
+                };
                 
-                // Line 1: Status
-                if stats_snapshot.received > 0 {
-                    print!(" Active          │");
-                } else {
-                    print!(" Waiting...      │");
-                }
+                println!("Rate:     {:.1} packets/sec     {}", packets_per_sec, progress_info);
                 
-                // Move to row 5, col 1 (second data row)
-                print!("\x1B[5;1H");
-                
-                // Line 2: Loss ratio
-                print!("│ Loss: {:5.1}%      │", stats_snapshot.loss_percent);
-                
-                // Line 2: Packet loss & sequence info
-                print!(" Lost: {:<7} │", stats_snapshot.lost);
-                
-                // Line 2: Min RTT
-                if let Some(min) = stats_snapshot.min_rtt_ms {
-                    print!(" Min: {:7.1} ms │", min);
-                } else {
-                    print!(" Min: ------- ms │");
-                }
-                
-                // Line 2: Export status
-                if let (Some(_), Some(_)) = (json_file_clone.as_ref(), csv_file_clone.as_ref()) {
-                    print!(" JSON+CSV export │");
-                } else if let Some(_) = json_file_clone.as_ref() {
-                    print!(" JSON export     │");
-                } else if let Some(_) = csv_file_clone.as_ref() {
-                    print!(" CSV export      │");
-                } else {
-                    print!(" No export       │");
-                }
-                
-                // Move to row 6, col 1 (third data row)
-                print!("\x1B[6;1H");
-                
-                // Line 3: Progress bar
+                // Calculate delivery rate for progress bar
                 let delivery_rate = if stats_snapshot.received + stats_snapshot.lost > 0 {
                     (stats_snapshot.received as f64 / (stats_snapshot.received + stats_snapshot.lost) as f64) * 100.0
                 } else {
                     100.0
                 };
                 
-                print!("│ {:<17} │", progress_bar(delivery_rate, 15));
+                // Sequence tracking row
+                println!("Sequence:  Next Expected: #{}    Delivery Rate: {}", 
+                         stats_snapshot.expected_next_seq,
+                         format!("{:.1}%", delivery_rate));
                 
-                // Line 3: Rate
-                let uptime_secs = start_time.elapsed().as_secs_f64().max(1.0);
-                let packets_per_sec = stats_snapshot.sent as f64 / uptime_secs;
-                print!(" Rate: {:.1}/s   │", packets_per_sec);
+                println!("{}", "-".repeat(80));
                 
-                // Line 3: Max RTT
-                if let Some(max) = stats_snapshot.max_rtt_ms {
-                    print!(" Max: {:7.1} ms │", max);
-                } else {
-                    print!(" Max: ------- ms │");
-                }
-                
-                // Line 3: Next Expected
-                print!(" Next: #{:<8} │", stats_snapshot.expected_next_seq);
-                
-                // Move to row 8, col 1 (last sent packet)
-                print!("\x1B[8;1H");
-                
-                // Last sent packet - fixed width to prevent display shift
+                // Activity rows
                 if let (Some(seq), Some(time)) = (last_activity_data.last_sent, last_activity_data.last_sent_time) {
-                    let last_sent_str = format!("│ Last sent:     Packet #{:<6} at {}               │", 
-                                               seq, time.format("%H:%M:%S.%3f"));
-                    print_fixed_line(&last_sent_str, 71);
+                    println!("Last sent:     Packet #{:<6} at {}", seq, time.format("%H:%M:%S.%3f"));
                 } else {
-                    print!("│ Last sent:     -                                                   │");
+                    println!("Last sent:     -");
                 }
                 
-                // Move to row 9, col 1 (last received packet)
-                print!("\x1B[9;1H");
-                
-                // Last received packet - fixed width to prevent display shift
                 if let (Some(seq), Some(time), Some(rtt)) = (last_activity_data.last_received, last_activity_data.last_received_time, last_activity_data.last_rtt_ms) {
-                    let last_recv_str = format!("│ Last received: Packet #{:<6} at {} (RTT: {} ms)       │", 
-                                               seq, time.format("%H:%M:%S.%3f"), rtt);
-                    print_fixed_line(&last_recv_str, 71);
+                    println!("Last received: Packet #{:<6} at {} (RTT: {} ms)", 
+                             seq, time.format("%H:%M:%S.%3f"), rtt);
                 } else {
-                    print!("│ Last received: -                                                   │");
+                    println!("Last received: -");
                 }
                 
-                // Go back to position after the table (for Ctrl+C handler)
-                print!("\x1B[12;1H");
+                println!("{}", "-".repeat(80));
+                
+                // Export status
+                let export_status = if let (Some(_), Some(_)) = (json_file_clone.as_ref(), csv_file_clone.as_ref()) {
+                    "JSON+CSV export enabled"
+                } else if let Some(_) = json_file_clone.as_ref() {
+                    "JSON export enabled"
+                } else if let Some(_) = csv_file_clone.as_ref() {
+                    "CSV export enabled"
+                } else {
+                    "No file export"
+                };
+                
+                println!("Status:   {}    Press Ctrl+C to exit", export_status);
                 
                 let _ = stdout.flush();
             }
@@ -832,14 +835,14 @@ fn main() -> std::io::Result<()> {
                 // Export to JSON if enabled
                 if let Some(ref file) = json_file_clone {
                     if let Err(e) = export_to_json(&stats_snapshot, file) {
-                        eprintln!("\n\n\n\n\n\n\n\n\n\n\n\nFailed to export to JSON: {}", e);
+                        eprintln!("Failed to export to JSON: {}", e);
                     }
                 }
                 
                 // Export to CSV if enabled
                 if let Some(ref file) = csv_file_clone {
                     if let Err(e) = export_to_csv(&stats_snapshot, file, false) {
-                        eprintln!("\n\n\n\n\n\n\n\n\n\n\n\nFailed to export to CSV: {}", e);
+                        eprintln!("Failed to export to CSV: {}", e);
                     }
                 }
             }

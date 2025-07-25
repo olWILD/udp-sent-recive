@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 use rand::Rng;
 use clap::{App, Arg};
 use serde::{Serialize, Deserialize};
@@ -55,7 +55,7 @@ impl ClockSync {
         let rtt_ms = (t4 - t1) - (t3 - t2);
         
         // Calculate one-way delay (assuming symmetric path)
-        let one_way_delay_ms = rtt_ms / 2;
+        let _one_way_delay_ms = rtt_ms / 2;
         
         // Calculate offset: how much the remote clock is ahead of local clock
         let offset = ((t2 as i64 - t1 as i64) + (t3 as i64 - t4 as i64)) / 2;
@@ -142,10 +142,22 @@ struct LatencyStats {
     // Percentile values
     p95_latency_ms: Option<f64>,
     p99_latency_ms: Option<f64>,
+    // Latency distribution buckets
+    latency_buckets: HashMap<String, u64>,
 }
 
 impl LatencyStats {
     fn new() -> Self {
+        // Initialize latency buckets
+        let buckets = [
+            "0-25ms", "25-50ms", "50-75ms", "75-100ms", "100-125ms", "125-150ms", "150-175ms", "175-200ms",
+            "200-250ms", "250-300ms", "300-350ms", "350-400ms", "400-450ms", "450-500ms",
+            "500-999ms", ">1000ms",
+        ]
+        .iter()
+        .map(|s| (s.to_string(), 0))
+        .collect();
+        
         LatencyStats {
             min_latency_ms: None,
             max_latency_ms: None,
@@ -157,6 +169,7 @@ impl LatencyStats {
             recent_latencies: VecDeque::with_capacity(1000),
             p95_latency_ms: None,
             p99_latency_ms: None,
+            latency_buckets: buckets,
         }
     }
     
@@ -203,8 +216,30 @@ impl LatencyStats {
             self.recent_latencies.pop_front();
         }
         
+        // Update latency buckets
+        let bucket = match latency_ms as u64 {
+            0..=24 => "0-25ms",
+            25..=49 => "25-50ms",
+            50..=74 => "50-75ms",
+            75..=99 => "75-100ms",
+            100..=124 => "100-125ms",
+            125..=149 => "125-150ms",
+            150..=174 => "150-175ms",
+            175..=199 => "175-200ms",
+            200..=249 => "200-250ms",
+            250..=299 => "250-300ms",
+            300..=349 => "300-350ms",
+            350..=399 => "350-400ms",
+            400..=449 => "400-450ms",
+            450..=499 => "450-500ms",
+            500..=999 => "500-999ms",
+            _ => ">1000ms",
+        };
+        *self.latency_buckets.entry(bucket.to_string()).or_insert(0) += 1;
+        
         // Update percentiles
         self.p95_latency_ms = self.percentile(95.0);
+        self.p99_latency_ms = self.percentile(99.0);
         self.p99_latency_ms = self.percentile(99.0);
     }
     
@@ -258,10 +293,116 @@ struct PacketStats {
     // Clock sync info
     clock_offset_ms: i64,
     clock_quality: String,
+    
+    // Latency distribution buckets
+    latency_buckets: HashMap<String, u64>,
+}
+
+// Структура для экспорта в CSV (с отдельными полями для каждого bucket)
+#[derive(Serialize, Debug)]
+struct CsvExportStats {
+    // Packet counting
+    sent: u64,
+    received: u64,
+    lost: u64,
+    #[serde(serialize_with = "round_f64")]
+    loss_percent: f64,
+    detected_lost_packets: u64,
+    
+    // Timing and latency data
+    timestamp: DateTime<Utc>,
+    #[serde(serialize_with = "round_option_f64")]
+    min_latency_ms: Option<f64>,
+    #[serde(serialize_with = "round_option_f64")]
+    avg_latency_ms: Option<f64>,
+    #[serde(serialize_with = "round_option_f64")]
+    max_latency_ms: Option<f64>,
+    #[serde(serialize_with = "round_option_f64")]
+    p95_latency_ms: Option<f64>,
+    #[serde(serialize_with = "round_option_f64")]
+    p99_latency_ms: Option<f64>,
+    #[serde(serialize_with = "round_option_f64")]
+    jitter_ms: Option<f64>,
+    
+    // Latency distribution buckets as separate fields
+    bucket_0_25ms: u64,
+    bucket_25_50ms: u64,
+    bucket_50_75ms: u64,
+    bucket_75_100ms: u64,
+    bucket_100_125ms: u64,
+    bucket_125_150ms: u64,
+    bucket_150_175ms: u64,
+    bucket_175_200ms: u64,
+    bucket_200_250ms: u64,
+    bucket_250_300ms: u64,
+    bucket_300_350ms: u64,
+    bucket_350_400ms: u64,
+    bucket_400_450ms: u64,
+    bucket_450_500ms: u64,
+    bucket_500_999ms: u64,
+    bucket_gt_1000ms: u64,
+}
+
+// Структура для экспорта в JSON (с HashMap для buckets)
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct JsonExportStats {
+    // Packet counting
+    sent: u64,
+    received: u64,
+    lost: u64,
+    #[serde(serialize_with = "round_f64")]
+    loss_percent: f64,
+    detected_lost_packets: u64,
+    
+    // Timing and latency data
+    timestamp: DateTime<Utc>,
+    #[serde(serialize_with = "round_option_f64")]
+    min_latency_ms: Option<f64>,
+    #[serde(serialize_with = "round_option_f64")]
+    avg_latency_ms: Option<f64>,
+    #[serde(serialize_with = "round_option_f64")]
+    max_latency_ms: Option<f64>,
+    #[serde(serialize_with = "round_option_f64")]
+    p95_latency_ms: Option<f64>,
+    #[serde(serialize_with = "round_option_f64")]
+    p99_latency_ms: Option<f64>,
+    #[serde(serialize_with = "round_option_f64")]
+    jitter_ms: Option<f64>,
+    
+    // Latency distribution buckets as HashMap
+    latency_buckets: HashMap<String, u64>,
+}
+
+// Функции для округления при сериализации
+fn round_f64<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_f64((value * 100.0).round() / 100.0)
+}
+
+fn round_option_f64<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(v) => serializer.serialize_some(&((v * 100.0).round() / 100.0)),
+        None => serializer.serialize_none(),
+    }
 }
 
 impl PacketStats {
     fn new() -> Self {
+        // Initialize latency buckets
+        let buckets = [
+            "0-50ms", "50-100ms", "100-150ms", "150-200ms", "200-250ms",
+            "250-300ms", "300-350ms", "350-400ms", "400-450ms", "450-500ms",
+            "500-999ms", ">1000ms",
+        ]
+        .iter()
+        .map(|s| (s.to_string(), 0))
+        .collect();
+        
         PacketStats {
             sent: 0,
             received: 0,
@@ -278,6 +419,7 @@ impl PacketStats {
             jitter_ms: None,
             clock_offset_ms: 0,
             clock_quality: "Unknown".to_string(),
+            latency_buckets: buckets,
         }
     }
 
@@ -328,12 +470,66 @@ impl PacketStats {
         self.p95_latency_ms = latency.p95_latency_ms;
         self.p99_latency_ms = latency.p99_latency_ms;
         self.jitter_ms = latency.jitter_ms;
+        self.latency_buckets = latency.latency_buckets.clone();
     }
     
     // Update clock sync info
     fn update_clock_sync(&mut self, clock_sync: &ClockSync) {
         self.clock_offset_ms = clock_sync.offset_ms;
         self.clock_quality = clock_sync.get_quality_string();
+    }
+    
+    // Конвертация в JsonExportStats для экспорта в JSON
+    fn to_json_export_stats(&self) -> JsonExportStats {
+        JsonExportStats {
+            sent: self.sent,
+            received: self.received,
+            lost: self.lost,
+            loss_percent: self.loss_percent,
+            detected_lost_packets: self.detected_lost_packets,
+            timestamp: self.timestamp,
+            min_latency_ms: self.min_latency_ms,
+            avg_latency_ms: self.avg_latency_ms,
+            max_latency_ms: self.max_latency_ms,
+            p95_latency_ms: self.p95_latency_ms,
+            p99_latency_ms: self.p99_latency_ms,
+            jitter_ms: self.jitter_ms,
+            latency_buckets: self.latency_buckets.clone(),
+        }
+    }
+    
+    // Конвертация в CsvExportStats для экспорта в CSV
+    fn to_csv_export_stats(&self) -> CsvExportStats {
+        CsvExportStats {
+            sent: self.sent,
+            received: self.received,
+            lost: self.lost,
+            loss_percent: self.loss_percent,
+            detected_lost_packets: self.detected_lost_packets,
+            timestamp: self.timestamp,
+            min_latency_ms: self.min_latency_ms,
+            avg_latency_ms: self.avg_latency_ms,
+            max_latency_ms: self.max_latency_ms,
+            p95_latency_ms: self.p95_latency_ms,
+            p99_latency_ms: self.p99_latency_ms,
+            jitter_ms: self.jitter_ms,
+            bucket_0_25ms: *self.latency_buckets.get("0-25ms").unwrap_or(&0),
+            bucket_25_50ms: *self.latency_buckets.get("25-50ms").unwrap_or(&0),
+            bucket_50_75ms: *self.latency_buckets.get("50-75ms").unwrap_or(&0),
+            bucket_75_100ms: *self.latency_buckets.get("75-100ms").unwrap_or(&0),
+            bucket_100_125ms: *self.latency_buckets.get("100-125ms").unwrap_or(&0),
+            bucket_125_150ms: *self.latency_buckets.get("125-150ms").unwrap_or(&0),
+            bucket_150_175ms: *self.latency_buckets.get("150-175ms").unwrap_or(&0),
+            bucket_175_200ms: *self.latency_buckets.get("175-200ms").unwrap_or(&0),
+            bucket_200_250ms: *self.latency_buckets.get("200-250ms").unwrap_or(&0),
+            bucket_250_300ms: *self.latency_buckets.get("250-300ms").unwrap_or(&0),
+            bucket_300_350ms: *self.latency_buckets.get("300-350ms").unwrap_or(&0),
+            bucket_350_400ms: *self.latency_buckets.get("350-400ms").unwrap_or(&0),
+            bucket_400_450ms: *self.latency_buckets.get("400-450ms").unwrap_or(&0),
+            bucket_450_500ms: *self.latency_buckets.get("450-500ms").unwrap_or(&0),
+            bucket_500_999ms: *self.latency_buckets.get("500-999ms").unwrap_or(&0),
+            bucket_gt_1000ms: *self.latency_buckets.get(">1000ms").unwrap_or(&0),
+        }
     }
 }
 
@@ -343,8 +539,9 @@ fn export_to_json(stats: &PacketStats, json_file: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     
-    // Convert stats to JSON
-    let stats_json = serde_json::to_value(stats)?;
+    // Convert stats to JSON export format
+    let export_stats = stats.to_json_export_stats();
+    let stats_json = serde_json::to_value(export_stats)?;
     
     // Read existing JSON array or create a new one
     let json_data = if std::path::Path::new(json_file).exists() {
@@ -407,8 +604,52 @@ fn export_to_csv(stats: &PacketStats, csv_file: &str, header_needed: bool) -> st
             .truncate(!file_exists || header_needed)
             .open(csv_file)?);
 
-    wtr.serialize(stats)?;
+    // Convert to CSV export format
+    let export_stats = stats.to_csv_export_stats();
+    wtr.serialize(export_stats)?;
     wtr.flush()?;
+    Ok(())
+}
+
+// Function to save interval statistics (only delta from last export)
+fn save_interval_stats(current_stats: &PacketStats, last_stats: &PacketStats, json_file: Option<&str>, csv_file: Option<&str>) -> std::io::Result<()> {
+    // Calculate interval delta
+    let mut interval_stats = current_stats.clone();
+    interval_stats.sent = current_stats.sent.saturating_sub(last_stats.sent);
+    interval_stats.received = current_stats.received.saturating_sub(last_stats.received);
+    interval_stats.lost = current_stats.lost.saturating_sub(last_stats.lost);
+    interval_stats.detected_lost_packets = current_stats.detected_lost_packets.saturating_sub(last_stats.detected_lost_packets);
+    
+    // Calculate interval latency buckets (delta)
+    for (bucket, current_count) in &current_stats.latency_buckets {
+        let last_count = last_stats.latency_buckets.get(bucket).unwrap_or(&0);
+        let interval_count = current_count.saturating_sub(*last_count);
+        interval_stats.latency_buckets.insert(bucket.clone(), interval_count);
+    }
+    
+    // Recalculate loss percentage for interval
+    let total_interval = interval_stats.received + interval_stats.lost;
+    if total_interval > 0 {
+        interval_stats.loss_percent = interval_stats.lost as f64 / total_interval as f64 * 100.0;
+    } else {
+        interval_stats.loss_percent = 0.0;
+    }
+    
+    // Update timestamp to current time
+    interval_stats.timestamp = Utc::now();
+    
+    if let Some(file) = json_file {
+        if let Err(e) = export_to_json(&interval_stats, file) {
+            eprintln!("Error saving interval JSON stats: {}", e);
+        }
+    }
+    
+    if let Some(file) = csv_file {
+        if let Err(e) = export_to_csv(&interval_stats, file, false) {
+            eprintln!("Error saving interval CSV stats: {}", e);
+        }
+    }
+    
     Ok(())
 }
 
@@ -599,7 +840,7 @@ fn main() -> std::io::Result<()> {
         .arg(Arg::with_name("stats_interval")
             .long("stats-interval")
             .value_name("SECONDS")
-            .help("Interval for printing and exporting statistics in seconds")
+            .help("Interval for printing statistics in seconds")
             .takes_value(true)
             .default_value("1"))
         .arg(Arg::with_name("sync")
@@ -618,6 +859,12 @@ fn main() -> std::io::Result<()> {
             .help("Interval for clock synchronization in seconds")
             .takes_value(true)
             .default_value("5"))
+        .arg(Arg::with_name("export_interval")
+            .long("export-interval")
+            .value_name("SECONDS")
+            .help("Interval for exporting statistics to files in seconds")
+            .takes_value(true)
+            .default_value("5"))
         .get_matches();
 
     let local_addr = matches.value_of("local").unwrap();
@@ -633,14 +880,31 @@ fn main() -> std::io::Result<()> {
         .expect("Sync timeout must be a valid number");
     let clock_sync_interval = matches.value_of("clock_sync_interval").unwrap().parse::<u64>()
         .expect("Clock sync interval must be a valid number");
+    let export_interval = matches.value_of("export_interval").unwrap().parse::<u64>()
+        .expect("Export interval must be a valid number");
     
-    let json_file = matches.value_of("json");
-    let csv_file = matches.value_of("csv");
+    // Auto-append file extensions if missing
+    let json_file = matches.value_of("json").map(|path| {
+        if path.ends_with(".json") {
+            path.to_string()
+        } else {
+            format!("{}.json", path)
+        }
+    });
+    
+    let csv_file = matches.value_of("csv").map(|path| {
+        if path.ends_with(".csv") {
+            path.to_string()
+        } else {
+            format!("{}.csv", path)
+        }
+    });
 
     // Initialize display
     println!("UDP Monitor v1.5 - Timestamp-based Latency Measurement");
     println!("Local: {}, Remote: {}, Interval: {}ms", local_addr, remote_addr, interval);
     println!("Clock synchronization every {} seconds", clock_sync_interval);
+    println!("Data export every {} seconds", export_interval);
     println!("Press Ctrl+C to exit and save statistics");
     println!();
     
@@ -652,7 +916,7 @@ fn main() -> std::io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     
     // Initialize CSV file with headers if needed
-    if let Some(file) = csv_file {
+    if let Some(ref file) = csv_file {
         if !std::path::Path::new(file).exists() {
             // Create a temporary stats object with headers
             let temp_stats = PacketStats::new();
@@ -662,7 +926,7 @@ fn main() -> std::io::Result<()> {
     }
     
     // Initialize JSON file if needed
-    if let Some(file) = json_file {
+    if let Some(ref file) = json_file {
         if !std::path::Path::new(file).exists() {
             let mut f = File::create(file)?;
             f.write_all(b"[]")?;
@@ -696,38 +960,44 @@ fn main() -> std::io::Result<()> {
     let final_stats = stats.clone();
     let final_latency = latency_stats.clone();
     let final_clock = clock_sync.clone();
-    let json_path = json_file.map(|s| s.to_string());
-    let csv_path = csv_file.map(|s| s.to_string());
+    let json_path = json_file.clone();
+    let csv_path = csv_file.clone();
     
     ctrlc::set_handler(move || {
-        println!("\nReceived Ctrl+C signal, notifying remote side...");
+        println!("\nReceived Ctrl+C signal, initiating shutdown...");
         r.store(false, Ordering::SeqCst);
         
         // Send termination packet to the remote side
         let _ = send_terminate_packet(&terminate_socket, &terminate_remote);
         
         // Give some time for threads to notice the termination signal
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(1000));
         
         // Save final statistics with all latency data included
         {
-            let mut stats_guard = final_stats.lock().unwrap();
-            
-            // Update with the latest latency stats
-            stats_guard.update_latency_stats(&final_latency.lock().unwrap());
-            
-            // Update with the latest clock sync info
-            stats_guard.update_clock_sync(&final_clock.lock().unwrap());
-            
-            let _ = save_final_stats(
-                &stats_guard, 
-                json_path.as_deref(),
-                csv_path.as_deref()
-            );
+            if let Ok(mut stats_guard) = final_stats.try_lock() {
+                // Update with the latest latency stats
+                if let Ok(latency_guard) = final_latency.try_lock() {
+                    stats_guard.update_latency_stats(&latency_guard);
+                }
+                
+                // Update with the latest clock sync info
+                if let Ok(clock_guard) = final_clock.try_lock() {
+                    stats_guard.update_clock_sync(&clock_guard);
+                }
+                
+                let _ = save_final_stats(
+                    &stats_guard, 
+                    json_path.as_deref(),
+                    csv_path.as_deref()
+                );
+            } else {
+                println!("Warning: Could not acquire lock for final stats save");
+            }
         }
         
-        println!("Exiting UDP Monitor. Goodbye!");
-        std::process::exit(0);
+       // println!("Shutdown signal sent to all threads...");
+        // Don't call exit here - let main thread handle cleanup
     }).expect("Error setting Ctrl+C handler");
 
     // Synchronization thread if enabled
@@ -843,24 +1113,32 @@ fn main() -> std::io::Result<()> {
                 // Time to send a clock sync packet
                 if let Ok(t1) = send_time_sync_packet(&clock_sync_socket, &clock_sync_remote) {
                     // Store the timestamp in pending requests
-                    time_sync_reqs.lock().unwrap().insert(t1, Instant::now());
+                    if let Ok(mut requests) = time_sync_reqs.try_lock() {
+                        requests.insert(t1, Instant::now());
+                    }
                     
                     // Update sync counter
-                    clock_sync_data.lock().unwrap().sync_packets_sent += 1;
+                    if let Ok(mut sync_data) = clock_sync_data.try_lock() {
+                        sync_data.sync_packets_sent += 1;
+                    }
                 }
                 
                 // Set next sync time
                 next_sync = Instant::now() + Duration::from_secs(clock_sync_interval);
                 
                 // Cleanup old pending requests (older than 10 seconds)
-                time_sync_reqs.lock().unwrap().retain(|_, time| {
-                    time.elapsed() < Duration::from_secs(10)
-                });
+                if let Ok(mut requests) = time_sync_reqs.try_lock() {
+                    requests.retain(|_, time| {
+                        time.elapsed() < Duration::from_secs(10)
+                    });
+                }
             }
             
-            // Don't spin the CPU, sleep for a short time
+            // Check running flag more frequently and don't spin the CPU
             thread::sleep(Duration::from_millis(100));
         }
+        
+        //println!("Clock sync thread shutting down gracefully");
     });
 
     // Sender thread
@@ -933,6 +1211,8 @@ fn main() -> std::io::Result<()> {
             
             thread::sleep(Duration::from_millis(interval));
         }
+        
+        //println!("Sender thread shutting down gracefully");
     });
 
     // Receiver thread
@@ -940,12 +1220,11 @@ fn main() -> std::io::Result<()> {
     let receiver_stats = Arc::clone(&stats);
     let receiver_activity = Arc::clone(&activity);
     let receiver_running = Arc::clone(&running);
-    let receiver_remote = remote_addr.clone();
     let receiver_latency = Arc::clone(&latency_stats);
     let receiver_clock_sync = Arc::clone(&clock_sync);
     let receiver_time_reqs = Arc::clone(&time_sync_requests);
-    let json_path_recv = json_file.map(|s| s.to_string());
-    let csv_path_recv = csv_file.map(|s| s.to_string());
+    let json_path_recv = json_file.clone();
+    let csv_path_recv = csv_file.clone();
     
     let receiver_handle = thread::spawn(move || {
         let mut buf = [0; 2048];
@@ -1053,23 +1332,27 @@ fn main() -> std::io::Result<()> {
                                 println!("\nReceived termination signal from remote side...");
                                 receiver_running.store(false, Ordering::SeqCst);
                                 
-                                // Save stats and exit
+                                // Save stats before exit
                                 {
-                                    let mut stats_guard = receiver_stats.lock().unwrap();
-                                    
-                                    // Update with latest latency and clock sync data
-                                    stats_guard.update_latency_stats(&receiver_latency.lock().unwrap());
-                                    stats_guard.update_clock_sync(&receiver_clock_sync.lock().unwrap());
-                                    
-                                    let _ = save_final_stats(
-                                        &stats_guard, 
-                                        json_path_recv.as_deref(),
-                                        csv_path_recv.as_deref()
-                                    );
+                                    if let Ok(mut stats_guard) = receiver_stats.try_lock() {
+                                        // Update with latest latency and clock sync data
+                                        if let Ok(latency_guard) = receiver_latency.try_lock() {
+                                            stats_guard.update_latency_stats(&latency_guard);
+                                        }
+                                        if let Ok(clock_guard) = receiver_clock_sync.try_lock() {
+                                            stats_guard.update_clock_sync(&clock_guard);
+                                        }
+                                        
+                                        let _ = save_final_stats(
+                                            &stats_guard, 
+                                            json_path_recv.as_deref(),
+                                            csv_path_recv.as_deref()
+                                        );
+                                    }
                                 }
                                 
-                                println!("Exiting UDP Monitor. Goodbye!");
-                                std::process::exit(0);
+                                //println!("Receiver thread shutting down gracefully...");
+                                return; // Exit receiver thread gracefully
                             },
                             
                             // Sync packets are handled in the sync thread
@@ -1086,50 +1369,72 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
+        
+        //println!("Receiver thread shutting down gracefully");
     });
 
     // Statistics reporting and export
     let stats_clone = Arc::clone(&stats);
     let activity_clone = Arc::clone(&activity);
     let stats_running = Arc::clone(&running);
-    let json_file_clone = json_file.map(|s| s.to_string());
-    let csv_file_clone = csv_file.map(|s| s.to_string());
+    let json_file_clone = json_file.clone();
+    let csv_file_clone = csv_file.clone();
     let latency_data = Arc::clone(&latency_stats);
     let clock_data = Arc::clone(&clock_sync);
+    let export_interval_clone = export_interval;
     
     let stats_handle = thread::spawn(move || {
         let mut spinner = Spinner::new();
-        let mut export_timer = 0;
         let mut activity_update_timer = 0;
         let mut last_activity_data = ActivityTracker::new();
+        let mut last_exported_stats = PacketStats::new(); // Track last exported stats for interval calculation
         let start_time = Instant::now();
+        let mut last_export_time = Instant::now(); // Track actual time for export interval
         
         while stats_running.load(Ordering::SeqCst) {
             // Get updated stats
-            let mut stats_snapshot = {
-                let mut stats_guard = stats_clone.lock().unwrap();
-                stats_guard.update_loss_stats();
-                
-                // Update latency and clock sync data for export
-                stats_guard.update_latency_stats(&latency_data.lock().unwrap());
-                stats_guard.update_clock_sync(&clock_data.lock().unwrap());
-                
-                stats_guard.clone()
+            let stats_snapshot = {
+                if let Ok(mut stats_guard) = stats_clone.try_lock() {
+                    stats_guard.update_loss_stats();
+                    
+                    // Update latency and clock sync data for export
+                    if let Ok(latency_guard) = latency_data.try_lock() {
+                        stats_guard.update_latency_stats(&latency_guard);
+                    }
+                    if let Ok(clock_guard) = clock_data.try_lock() {
+                        stats_guard.update_clock_sync(&clock_guard);
+                    }
+                    
+                    stats_guard.clone()
+                } else {
+                    // If we can't get lock, skip this iteration
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
             };
             
             // Get activity status - only update once per second
             activity_update_timer += 1;
             if activity_update_timer >= 1 {
                 activity_update_timer = 0;
-                let activity_guard = activity_clone.lock().unwrap();
-                last_activity_data = activity_guard.clone();
+                if let Ok(activity_guard) = activity_clone.try_lock() {
+                    last_activity_data = activity_guard.clone();
+                }
             }
             
             // Get latency stats
-            let latency_stats_str = latency_data.lock().unwrap().get_stats_string();
+            let latency_stats_str = if let Ok(latency_guard) = latency_data.try_lock() {
+                latency_guard.get_stats_string()
+            } else {
+                "Stats unavailable".to_string()
+            };
             
             // Get clock sync info
-            let clock_sync_info = clock_data.lock().unwrap().clone();
+            let clock_sync_info = if let Ok(clock_guard) = clock_data.try_lock() {
+                clock_guard.clone()
+            } else {
+                ClockSync::new()
+            };
             
             // Update the display - now in row format with no borders
             {
@@ -1217,41 +1522,86 @@ fn main() -> std::io::Result<()> {
                 };
                 
                 println!("Status:   {}    Press Ctrl+C to exit", export_status);
-                println!("Send interval: {} ms  Clock sync interval: {} sec", interval, clock_sync_interval);
+                println!("Send interval: {} ms  Clock sync interval: {} sec  Export interval: {} sec", 
+                        interval, clock_sync_interval, export_interval_clone);
                 
                 let _ = stdout.flush();
             }
             
-            // Export data every 5 seconds to avoid excessive file writes
-            export_timer += 1;
-            if export_timer >= 5 {
-                export_timer = 0;
+            // Export data based on actual time elapsed, not iteration count
+            if last_export_time.elapsed() >= Duration::from_secs(export_interval_clone) {
+                last_export_time = Instant::now();
                 
-                // Export to JSON if enabled
-                if let Some(ref file) = json_file_clone {
-                    if let Err(e) = export_to_json(&stats_snapshot, file) {
-                        eprintln!("Failed to export to JSON: {}", e);
-                    }
-                }
+                // Save interval statistics (delta from last export)
+                let _ = save_interval_stats(
+                    &stats_snapshot, 
+                    &last_exported_stats,
+                    json_file_clone.as_deref(),
+                    csv_file_clone.as_deref()
+                );
                 
-                // Export to CSV if enabled
-                if let Some(ref file) = csv_file_clone {
-                    if let Err(e) = export_to_csv(&stats_snapshot, file, false) {
-                        eprintln!("Failed to export to CSV: {}", e);
-                    }
-                }
+                // Update last exported stats for next interval calculation
+                last_exported_stats = stats_snapshot.clone();
             }
             
             // Sleep for stats_interval
             thread::sleep(Duration::from_secs(stats_interval));
         }
+        
+       // println!("Stats thread shutting down gracefully");
     });
 
-    // Wait for all threads to complete
-    sender_handle.join().unwrap();
-    receiver_handle.join().unwrap();
-    stats_handle.join().unwrap();
-    clock_sync_handle.join().unwrap();
+    // Wait for all threads to complete with timeout
+    println!("Waiting for threads to complete...");
+    
+    let mut all_joined = true;
+    
+    // Try to join sender thread
+    match sender_handle.join() {
+        Ok(_) => println!(),
+        Err(e) => {
+            eprintln!("Sender thread panicked: {:?}", e);
+            all_joined = false;
+        }
+    }
+    
+    // Try to join receiver thread
+    match receiver_handle.join() {
+        Ok(_) => println!(),
+        Err(e) => {
+            eprintln!("Receiver thread panicked: {:?}", e);
+            all_joined = false;
+        }
+    }
+    
+    // Try to join stats thread
+    match stats_handle.join() {
+        Ok(_) => println!(),
+        Err(e) => {
+            eprintln!("Stats thread panicked: {:?}", e);
+            all_joined = false;
+        }
+    }
+    
+    // Try to join clock sync thread
+    match clock_sync_handle.join() {
+        Ok(_) => println!(),
+        Err(e) => {
+            eprintln!("Clock sync thread panicked: {:?}", e);
+            all_joined = false;
+        }
+    }
+    
+    if all_joined {
+        println!("All threads completed successfully");
+    } else {
+        println!("Some threads had issues, but shutdown completed");
+    }
+    
+    // Final cleanup - close socket explicitly
+    drop(socket);
+    
+    println!("UDP Monitor shutdown complete. Goodbye!");
 
     Ok(())
 }

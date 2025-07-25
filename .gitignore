@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target
+*.pdb
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test output files
+*.json
+*.csv

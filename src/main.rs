@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 use std::collections::{VecDeque, HashMap};
-use rand::Rng;
 use clap::{App, Arg};
 use serde::{Serialize, Deserialize};
 use serde_json::{Value, json};
@@ -144,6 +143,20 @@ struct LatencyStats {
     p99_latency_ms: Option<f64>,
     // Latency distribution buckets
     latency_buckets: HashMap<String, u64>,
+    // Interval tracking - for calculating interval-based statistics
+    interval_latencies: VecDeque<f64>,  // Latencies since last interval export
+}
+
+// Structure for interval latency statistics - calculated for each export interval
+#[derive(Clone, Debug)]
+struct IntervalLatencyStats {
+    min_latency_ms: Option<f64>,
+    max_latency_ms: Option<f64>,
+    avg_latency_ms: Option<f64>,
+    p95_latency_ms: Option<f64>,
+    p99_latency_ms: Option<f64>,
+    jitter_ms: Option<f64>,
+    samples_count: u64,
 }
 
 impl LatencyStats {
@@ -170,6 +183,7 @@ impl LatencyStats {
             p95_latency_ms: None,
             p99_latency_ms: None,
             latency_buckets: buckets,
+            interval_latencies: VecDeque::new(),
         }
     }
     
@@ -215,6 +229,9 @@ impl LatencyStats {
         if self.recent_latencies.len() > 1000 {
             self.recent_latencies.pop_front();
         }
+        
+        // Store latency for interval calculations
+        self.interval_latencies.push_back(latency_ms);
         
         // Update latency buckets
         let bucket = match latency_ms as u64 {
@@ -268,6 +285,69 @@ impl LatencyStats {
         
         format!("Min: {} ms  Avg: {} ms  Max: {} ms  P95: {} ms  P99: {} ms  Jitter: {} ms",
                 min, avg, max, p95, p99, jitter)
+    }
+    
+    // Calculate interval statistics from collected interval latencies
+    fn calculate_interval_stats(&self) -> IntervalLatencyStats {
+        if self.interval_latencies.is_empty() {
+            return IntervalLatencyStats {
+                min_latency_ms: None,
+                max_latency_ms: None,
+                avg_latency_ms: None,
+                p95_latency_ms: None,
+                p99_latency_ms: None,
+                jitter_ms: None,
+                samples_count: 0,
+            };
+        }
+        
+        let latencies: Vec<f64> = self.interval_latencies.iter().cloned().collect();
+        
+        // Calculate min/max
+        let min_latency = latencies.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_latency = latencies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        
+        // Calculate average
+        let total: f64 = latencies.iter().sum();
+        let avg_latency = total / latencies.len() as f64;
+        
+        // Calculate percentiles
+        let mut sorted = latencies.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let p95_idx = ((95.0 * sorted.len() as f64 / 100.0).floor() as usize).min(sorted.len() - 1);
+        let p99_idx = ((99.0 * sorted.len() as f64 / 100.0).floor() as usize).min(sorted.len() - 1);
+        
+        let p95_latency = Some(sorted[p95_idx]);
+        let p99_latency = Some(sorted[p99_idx]);
+        
+        // Calculate jitter for interval (average variation between consecutive measurements)
+        let mut jitter_sum = 0.0;
+        let mut jitter_count = 0;
+        for i in 1..latencies.len() {
+            jitter_sum += (latencies[i] - latencies[i-1]).abs();
+            jitter_count += 1;
+        }
+        let jitter = if jitter_count > 0 {
+            Some(jitter_sum / jitter_count as f64)
+        } else {
+            None
+        };
+        
+        IntervalLatencyStats {
+            min_latency_ms: Some(min_latency),
+            max_latency_ms: Some(max_latency),
+            avg_latency_ms: Some(avg_latency),
+            p95_latency_ms: p95_latency,
+            p99_latency_ms: p99_latency,
+            jitter_ms: jitter,
+            samples_count: latencies.len() as u64,
+        }
+    }
+    
+    // Clear interval latencies after export (call this after calculating interval stats)
+    fn clear_interval_latencies(&mut self) {
+        self.interval_latencies.clear();
     }
 }
 
@@ -607,7 +687,13 @@ fn export_to_csv(stats: &PacketStats, csv_file: &str, header_needed: bool) -> st
 }
 
 // Function to save interval statistics (only delta from last export)
-fn save_interval_stats(current_stats: &PacketStats, last_stats: &PacketStats, json_file: Option<&str>, csv_file: Option<&str>) -> std::io::Result<()> {
+fn save_interval_stats(
+    current_stats: &PacketStats, 
+    last_stats: &PacketStats, 
+    latency_stats: &Arc<Mutex<LatencyStats>>,
+    json_file: Option<&str>, 
+    csv_file: Option<&str>
+) -> std::io::Result<()> {
     // Calculate interval delta
     let mut interval_stats = current_stats.clone();
     interval_stats.sent = current_stats.sent.saturating_sub(last_stats.sent);
@@ -620,6 +706,22 @@ fn save_interval_stats(current_stats: &PacketStats, last_stats: &PacketStats, js
         let last_count = last_stats.latency_buckets.get(bucket).unwrap_or(&0);
         let interval_count = current_count.saturating_sub(*last_count);
         interval_stats.latency_buckets.insert(bucket.clone(), interval_count);
+    }
+    
+    // Calculate interval latency statistics
+    if let Ok(mut latency_guard) = latency_stats.try_lock() {
+        let interval_latency_stats = latency_guard.calculate_interval_stats();
+        
+        // Update interval_stats with interval-based latency values
+        interval_stats.min_latency_ms = interval_latency_stats.min_latency_ms;
+        interval_stats.avg_latency_ms = interval_latency_stats.avg_latency_ms;
+        interval_stats.max_latency_ms = interval_latency_stats.max_latency_ms;
+        interval_stats.p95_latency_ms = interval_latency_stats.p95_latency_ms;
+        interval_stats.p99_latency_ms = interval_latency_stats.p99_latency_ms;
+        interval_stats.jitter_ms = interval_latency_stats.jitter_ms;
+        
+        // Clear interval latencies for next period
+        latency_guard.clear_interval_latencies();
     }
     
     // Recalculate loss percentage for interval
@@ -1144,7 +1246,6 @@ fn main() -> std::io::Result<()> {
     let sender_remote = remote_addr.clone();
     
     let sender_handle = thread::spawn(move || {
-        let mut rng = rand::thread_rng();
         let mut seq_num: u64 = 0;
         let mut sent_count = 0;
 
@@ -1529,6 +1630,7 @@ fn main() -> std::io::Result<()> {
                 let _ = save_interval_stats(
                     &stats_snapshot, 
                     &last_exported_stats,
+                    &latency_data,
                     json_file_clone.as_deref(),
                     csv_file_clone.as_deref()
                 );

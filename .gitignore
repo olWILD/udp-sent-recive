@@ -2,6 +2,9 @@
 /target
 *.pdb
 
+*.lock
+.exe
+
 # IDE files
 .vscode/
 .idea/

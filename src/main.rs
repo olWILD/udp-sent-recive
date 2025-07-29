@@ -294,15 +294,14 @@ impl LatencyStats {
     
     // Get latency stats string
     fn get_stats_string(&self) -> String {
-        let min = self.min_latency_ms.map_or("N/A".to_string(), |v| format!("{:.1}", v));
-        let avg = self.avg_latency_ms.map_or("N/A".to_string(), |v| format!("{:.1}", v));
-        let max = self.max_latency_ms.map_or("N/A".to_string(), |v| format!("{:.1}", v));
-        let p95 = self.p95_latency_ms.map_or("N/A".to_string(), |v| format!("{:.1}", v));
-        let p99 = self.p99_latency_ms.map_or("N/A".to_string(), |v| format!("{:.1}", v));
-        let jitter = self.jitter_ms.map_or("N/A".to_string(), |v| format!("{:.1}", v));
+        let min = self.min_latency_ms.map_or("N/A".to_string(), |v| format!("{v:.1}"));
+        let avg = self.avg_latency_ms.map_or("N/A".to_string(), |v| format!("{v:.1}"));
+        let max = self.max_latency_ms.map_or("N/A".to_string(), |v| format!("{v:.1}"));
+        let p95 = self.p95_latency_ms.map_or("N/A".to_string(), |v| format!("{v:.1}"));
+        let p99 = self.p99_latency_ms.map_or("N/A".to_string(), |v| format!("{v:.1}"));
+        let jitter = self.jitter_ms.map_or("N/A".to_string(), |v| format!("{v:.1}"));
         
-        format!("Min: {} ms  Avg: {} ms  Max: {} ms  P95: {} ms  P99: {} ms  Jitter: {} ms",
-                min, avg, max, p95, p99, jitter)
+        format!("Min: {min} ms  Avg: {avg} ms  Max: {max} ms  P95: {p95} ms  P99: {p99} ms  Jitter: {jitter} ms")
     }
     
     // Calculate interval statistics from collected interval latencies
@@ -661,7 +660,7 @@ fn export_to_json(stats: &PacketStats, json_file: &str) -> std::io::Result<()> {
     };
     
     // Write the updated JSON array to a temporary file
-    let temp_file = format!("{}.tmp", json_file);
+    let temp_file = format!("{json_file}.tmp");
     {
         let mut file = File::create(&temp_file)?;
         let json_str = serde_json::to_string_pretty(&json_data)?;
@@ -753,13 +752,13 @@ fn save_interval_stats(
     
     if let Some(file) = json_file {
         if let Err(e) = export_to_json(&interval_stats, file) {
-            eprintln!("Error saving interval JSON stats: {}", e);
+            eprintln!("Error saving interval JSON stats: {e}");
         }
     }
     
     if let Some(file) = csv_file {
         if let Err(e) = export_to_csv(&interval_stats, file, false) {
-            eprintln!("Error saving interval CSV stats: {}", e);
+            eprintln!("Error saving interval CSV stats: {e}");
         }
     }
     
@@ -772,18 +771,18 @@ fn save_final_stats(stats: &PacketStats, json_file: Option<&str>, csv_file: Opti
     
     if let Some(file) = json_file {
         if let Err(e) = export_to_json(stats, file) {
-            eprintln!("Error saving final JSON stats: {}", e);
+            eprintln!("Error saving final JSON stats: {e}");
         } else {
-            println!("Final statistics saved to JSON file: {}", file);
+            println!("Final statistics saved to JSON file: {file}");
         }
     }
     
     if let Some(file) = csv_file {
         // Use header_needed=true to ensure headers are present in a new file
         if let Err(e) = export_to_csv(stats, file, !std::path::Path::new(file).exists()) {
-            eprintln!("Error saving final CSV stats: {}", e);
+            eprintln!("Error saving final CSV stats: {e}");
         } else {
-            println!("Final statistics saved to CSV file: {}", file);
+            println!("Final statistics saved to CSV file: {file}");
         }
     }
     
@@ -853,7 +852,7 @@ fn send_terminate_packet(socket: &UdpSocket, remote_addr: &SocketAddr) -> std::i
     // Try to send the terminate packet multiple times for reliability
     for _ in 0..TERMINATE_PACKET_RETRY_COUNT {
         if let Err(e) = socket.send_to(&packet, remote_addr) {
-            eprintln!("Failed to send terminate packet: {}", e);
+            eprintln!("Failed to send terminate packet: {e}");
         }
         thread::sleep(Duration::from_millis(TERMINATE_PACKET_RETRY_DELAY_MS));
     }
@@ -875,7 +874,7 @@ fn send_time_sync_packet(socket: &UdpSocket, remote_addr: &SocketAddr) -> std::i
     packet.extend_from_slice(&t1.to_be_bytes());
     
     if let Err(e) = socket.send_to(&packet, remote_addr) {
-        eprintln!("Failed to send time sync packet: {}", e);
+        eprintln!("Failed to send time sync packet: {e}");
     }
     
     Ok(t1)
@@ -1001,7 +1000,7 @@ fn main() -> std::io::Result<()> {
         if path.ends_with(".json") {
             path.to_string()
         } else {
-            format!("{}.json", path)
+            format!("{path}.json")
         }
     });
     
@@ -1009,15 +1008,15 @@ fn main() -> std::io::Result<()> {
         if path.ends_with(".csv") {
             path.to_string()
         } else {
-            format!("{}.csv", path)
+            format!("{path}.csv")
         }
     });
 
     // Initialize display
     println!("UDP Monitor v1.5 - Timestamp-based Latency Measurement");
-    println!("Local: {}, Remote: {}, Interval: {}ms", local_addr, remote_addr, interval);
-    println!("Clock synchronization every {} seconds", clock_sync_interval);
-    println!("Data export every {} seconds", export_interval);
+    println!("Local: {local_addr}, Remote: {remote_addr}, Interval: {interval}ms");
+    println!("Clock synchronization every {clock_sync_interval} seconds");
+    println!("Data export every {export_interval} seconds");
     println!("Press Ctrl+C to exit and save statistics");
     println!();
     
@@ -1034,7 +1033,7 @@ fn main() -> std::io::Result<()> {
             // Create a temporary stats object with headers
             let temp_stats = PacketStats::new();
             export_to_csv(&temp_stats, file, true)?;
-            println!("Created CSV file with headers: {}", file);
+            println!("Created CSV file with headers: {file}");
         }
     }
     
@@ -1044,7 +1043,7 @@ fn main() -> std::io::Result<()> {
             let mut f = File::create(file)?;
             f.write_all(b"[]")?;
             f.flush()?;
-            println!("Created empty JSON array file: {}", file);
+            println!("Created empty JSON array file: {file}");
         }
     }
     
@@ -1068,7 +1067,7 @@ fn main() -> std::io::Result<()> {
     
     // Setup clean termination signal
     let terminate_socket = Arc::clone(&socket);
-    let terminate_remote = remote_addr.clone();
+    let terminate_remote = remote_addr;
     let r = running.clone();
     let final_stats = stats.clone();
     let final_latency = latency_stats.clone();
@@ -1113,7 +1112,7 @@ fn main() -> std::io::Result<()> {
                     );
                 },
                 Err(e) => {
-                    println!("Warning: Could not acquire stats lock for final save: {}", e);
+                    println!("Warning: Could not acquire stats lock for final save: {e}");
                 }
             }
         }
@@ -1126,7 +1125,7 @@ fn main() -> std::io::Result<()> {
         let sync_socket = Arc::clone(&socket);
         let sync_running = Arc::clone(&running);
         let sync_status = Arc::clone(&synchronized);
-        let sync_remote = remote_addr.clone();
+        let sync_remote = remote_addr;
         
         let sync_handle = thread::spawn(move || {
             let start_time = Instant::now();
@@ -1143,8 +1142,8 @@ fn main() -> std::io::Result<()> {
                 let mut sync_packet = Vec::with_capacity(16);
                 sync_packet.push(PACKET_TYPE_SYNC);
                 
-                if let Err(e) = sync_socket.send_to(&sync_packet, &sync_remote) {
-                    eprintln!("Failed to send sync packet: {}", e);
+                if let Err(e) = sync_socket.send_to(&sync_packet, sync_remote) {
+                    eprintln!("Failed to send sync packet: {e}");
                 }
                 
                 // Try to receive sync or sync_ack packet
@@ -1160,8 +1159,8 @@ fn main() -> std::io::Result<()> {
                             let mut ack_packet = Vec::with_capacity(16);
                             ack_packet.push(PACKET_TYPE_SYNC_ACK);
                             
-                            if let Err(e) = sync_socket.send_to(&ack_packet, &sync_remote) {
-                                eprintln!("Failed to send sync ack packet: {}", e);
+                            if let Err(e) = sync_socket.send_to(&ack_packet, sync_remote) {
+                                eprintln!("Failed to send sync ack packet: {e}");
                             }
                         } else if packet_type == PACKET_TYPE_SYNC_ACK {
                             // Received sync_ack, we're synchronized
@@ -1171,7 +1170,7 @@ fn main() -> std::io::Result<()> {
                     },
                     Err(e) => {
                         if e.kind() != std::io::ErrorKind::WouldBlock {
-                            eprintln!("Failed to receive sync packet: {}", e);
+                            eprintln!("Failed to receive sync packet: {e}");
                         }
                     },
                     _ => {}
@@ -1221,7 +1220,7 @@ fn main() -> std::io::Result<()> {
     // Clock synchronization thread
     let clock_sync_socket = Arc::clone(&socket);
     let clock_sync_running = Arc::clone(&running);
-    let clock_sync_remote = remote_addr.clone();
+    let clock_sync_remote = remote_addr;
     let clock_sync_data = Arc::clone(&clock_sync);
     let time_sync_reqs = Arc::clone(&time_sync_requests);
     
@@ -1287,7 +1286,7 @@ fn main() -> std::io::Result<()> {
     let sender_activity = Arc::clone(&activity);
     let sender_running = Arc::clone(&running);
     let sender_sync = Arc::clone(&synchronized);
-    let sender_remote = remote_addr.clone();
+    let sender_remote = remote_addr;
     
     let sender_handle = thread::spawn(move || {
         let mut seq_num: u64 = 0;
@@ -1327,7 +1326,7 @@ fn main() -> std::io::Result<()> {
                 remaining -= chunk_size;
             }
 
-            match sender_socket.send_to(&packet, &sender_remote) {
+            match sender_socket.send_to(&packet, sender_remote) {
                 Ok(_) => {
                     // Update activity tracker
                     if let Ok(mut activity) = sender_activity.lock() {
@@ -1340,7 +1339,7 @@ fn main() -> std::io::Result<()> {
                     sent_count += 1;
                 },
                 Err(e) => {
-                    eprintln!("Failed to send packet: {}", e);
+                    eprintln!("Failed to send packet: {e}");
                     // Add small delay on send errors to prevent spinning
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -1465,7 +1464,7 @@ fn main() -> std::io::Result<()> {
                                 
                                 // Send time sync response with timestamps T1, T2, T3
                                 if let Err(e) = send_time_sync_response(&receiver_socket, t1, &src) {
-                                    eprintln!("Failed to send time sync response: {}", e);
+                                    eprintln!("Failed to send time sync response: {e}");
                                 }
                             },
                             
@@ -1534,7 +1533,7 @@ fn main() -> std::io::Result<()> {
                                             );
                                         },
                                         Err(e) => {
-                                            eprintln!("Warning: Could not acquire stats lock for final save: {}", e);
+                                            eprintln!("Warning: Could not acquire stats lock for final save: {e}");
                                         }
                                     }
                                 }
@@ -1550,7 +1549,7 @@ fn main() -> std::io::Result<()> {
                 },
                 Err(e) => {
                     if e.kind() != std::io::ErrorKind::WouldBlock && e.kind() != std::io::ErrorKind::TimedOut {
-                        eprintln!("Failed to receive: {}", e);
+                        eprintln!("Failed to receive: {e}");
                     }
                     // Small sleep to avoid CPU spinning on non-blocking socket
                     thread::sleep(Duration::from_millis(THREAD_SLEEP_MS));
@@ -1597,7 +1596,7 @@ fn main() -> std::io::Result<()> {
                         stats_guard.clone()
                     },
                     Err(e) => {
-                        eprintln!("Error acquiring stats lock: {}", e);
+                        eprintln!("Error acquiring stats lock: {e}");
                         // Sleep and continue to avoid spinning
                         thread::sleep(Duration::from_secs(1));
                         continue;
@@ -1663,12 +1662,12 @@ fn main() -> std::io::Result<()> {
                         clock_sync_info.sync_packets_sent);
                 
                 // Packets row
-                println!("Packets:  Sent: {}  Received: {}  Lost: {} ({}%)", 
+                println!("Packets:  Sent: {}  Received: {}  Lost: {} ({:.1}%)", 
                          stats_snapshot.sent, stats_snapshot.received, 
-                         stats_snapshot.lost, format!("{:.1}", stats_snapshot.loss_percent));
+                         stats_snapshot.lost, stats_snapshot.loss_percent);
                 
                 // Latency stats
-                println!("Latency:  {}", latency_stats_str);
+                println!("Latency:  {latency_stats_str}");
                 
                 // Rate and completion row
                 let uptime_secs = start_time.elapsed().as_secs_f64().max(1.0);
@@ -1676,12 +1675,12 @@ fn main() -> std::io::Result<()> {
                 
                 let progress_info = if count > 0 {
                     let progress = (stats_snapshot.sent as f64 / count as f64) * 100.0;
-                    format!("Progress: {:.1}% complete", progress)
+                    format!("Progress: {progress:.1}% complete")
                 } else {
                     "Running continuously".to_string()
                 };
                 
-                println!("Rate:     {:.1} packets/sec     {}", packets_per_sec, progress_info);
+                println!("Rate:     {packets_per_sec:.1} packets/sec     {progress_info}");
                 
                 // Calculate delivery rate for progress bar
                 let delivery_rate = if stats_snapshot.received + stats_snapshot.lost > 0 {
@@ -1691,9 +1690,8 @@ fn main() -> std::io::Result<()> {
                 };
                 
                 // Sequence tracking row
-                println!("Sequence:  Next Expected: #{}    Delivery Rate: {}", 
-                         stats_snapshot.expected_next_seq,
-                         format!("{:.1}%", delivery_rate));
+                println!("Sequence:  Next Expected: #{}    Delivery Rate: {:.1}%", 
+                         stats_snapshot.expected_next_seq, delivery_rate);
                 
                 println!("{}", "-".repeat(80));
                 
@@ -1720,17 +1718,16 @@ fn main() -> std::io::Result<()> {
                 // Export status
                 let export_status = if let (Some(_), Some(_)) = (json_file_clone.as_ref(), csv_file_clone.as_ref()) {
                     "JSON+CSV export enabled"
-                } else if let Some(_) = json_file_clone.as_ref() {
+                } else if json_file_clone.as_ref().is_some() {
                     "JSON export enabled"
-                } else if let Some(_) = csv_file_clone.as_ref() {
+                } else if csv_file_clone.as_ref().is_some() {
                     "CSV export enabled"
                 } else {
                     "No file export"
                 };
                 
-                println!("Status:   {}    Press Ctrl+C to exit", export_status);
-                println!("Send interval: {} ms  Clock sync interval: {} sec  Export interval: {} sec", 
-                        interval, clock_sync_interval, export_interval_clone);
+                println!("Status:   {export_status}    Press Ctrl+C to exit");
+                println!("Send interval: {interval} ms  Clock sync interval: {clock_sync_interval} sec  Export interval: {export_interval_clone} sec");
                 
                 let _ = stdout.flush();
             }
@@ -1768,7 +1765,7 @@ fn main() -> std::io::Result<()> {
     match sender_handle.join() {
         Ok(_) => println!("Sender thread completed successfully"),
         Err(e) => {
-            eprintln!("Sender thread panicked: {:?}", e);
+            eprintln!("Sender thread panicked: {e:?}");
             all_joined = false;
         }
     }
@@ -1777,7 +1774,7 @@ fn main() -> std::io::Result<()> {
     match receiver_handle.join() {
         Ok(_) => println!("Receiver thread completed successfully"),
         Err(e) => {
-            eprintln!("Receiver thread panicked: {:?}", e);
+            eprintln!("Receiver thread panicked: {e:?}");
             all_joined = false;
         }
     }
@@ -1786,7 +1783,7 @@ fn main() -> std::io::Result<()> {
     match stats_handle.join() {
         Ok(_) => println!("Stats thread completed successfully"),
         Err(e) => {
-            eprintln!("Stats thread panicked: {:?}", e);
+            eprintln!("Stats thread panicked: {e:?}");
             all_joined = false;
         }
     }
@@ -1795,7 +1792,7 @@ fn main() -> std::io::Result<()> {
     match clock_sync_handle.join() {
         Ok(_) => println!("Clock sync thread completed successfully"),
         Err(e) => {
-            eprintln!("Clock sync thread panicked: {:?}", e);
+            eprintln!("Clock sync thread panicked: {e:?}");
             all_joined = false;
         }
     }

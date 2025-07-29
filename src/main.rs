@@ -298,7 +298,6 @@ struct PacketStats {
     latency_buckets: HashMap<String, u64>,
 }
 
-// Структура для экспорта в CSV (с отдельными полями для каждого bucket)
 #[derive(Serialize, Debug)]
 struct CsvExportStats {
     // Packet counting
@@ -343,7 +342,7 @@ struct CsvExportStats {
     bucket_gt_1000ms: u64,
 }
 
-// Структура для экспорта в JSON (с HashMap для buckets)
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct JsonExportStats {
     // Packet counting
@@ -373,7 +372,6 @@ struct JsonExportStats {
     latency_buckets: HashMap<String, u64>,
 }
 
-// Функции для округления при сериализации
 fn round_f64<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -478,8 +476,6 @@ impl PacketStats {
         self.clock_offset_ms = clock_sync.offset_ms;
         self.clock_quality = clock_sync.get_quality_string();
     }
-    
-    // Конвертация в JsonExportStats для экспорта в JSON
     fn to_json_export_stats(&self) -> JsonExportStats {
         JsonExportStats {
             sent: self.sent,
@@ -497,8 +493,7 @@ impl PacketStats {
             latency_buckets: self.latency_buckets.clone(),
         }
     }
-    
-    // Конвертация в CsvExportStats для экспорта в CSV
+
     fn to_csv_export_stats(&self) -> CsvExportStats {
         CsvExportStats {
             sent: self.sent,
@@ -1138,7 +1133,6 @@ fn main() -> std::io::Result<()> {
             thread::sleep(Duration::from_millis(100));
         }
         
-        //println!("Clock sync thread shutting down gracefully");
     });
 
     // Sender thread
@@ -1173,8 +1167,8 @@ fn main() -> std::io::Result<()> {
             packet.extend_from_slice(&timestamp.to_be_bytes());
             
             // Add lorem ipsum data
-            let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.";
-            let data_size = rng.gen_range(50..500);
+            let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.";
+            let data_size = 500;
             let mut remaining = data_size;
             
             while remaining > 0 {
@@ -1212,7 +1206,6 @@ fn main() -> std::io::Result<()> {
             thread::sleep(Duration::from_millis(interval));
         }
         
-        //println!("Sender thread shutting down gracefully");
     });
 
     // Receiver thread

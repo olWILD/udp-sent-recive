@@ -19,6 +19,22 @@ const PACKET_TYPE_TERMINATE: u8 = 4;
 const PACKET_TYPE_TIME_SYNC: u8 = 5;          // Packet for time synchronization
 const PACKET_TYPE_TIME_SYNC_RESP: u8 = 6;     // Response to time sync packet
 
+// Configuration constants
+const CLOCK_SYNC_VALIDITY_DURATION_SECS: u64 = 30;
+const CLOCK_SYNC_MIN_SAMPLES: u64 = 5;
+const CLOCK_SYNC_RELIABLE_STDDEV: f64 = 50.0;
+const CLOCK_SYNC_EXCELLENT_STDDEV: f64 = 10.0;
+const CLOCK_SYNC_GOOD_STDDEV: f64 = 25.0;
+const LATENCY_SAMPLE_HISTORY_SIZE: usize = 1000;
+const CLOCK_OFFSET_HISTORY_SIZE: usize = 10;
+const LATENCY_BUCKET_COUNT: usize = 16;
+const TERMINATE_PACKET_RETRY_COUNT: usize = 5;
+const TERMINATE_PACKET_RETRY_DELAY_MS: u64 = 100;
+const TIME_SYNC_REQUEST_TIMEOUT_SECS: u64 = 10;
+const SOCKET_READ_TIMEOUT_MS: u64 = 100;
+const THREAD_SLEEP_MS: u64 = 10;
+const JITTER_EMA_ALPHA: f64 = 0.2; // Exponential moving average alpha for jitter calculation
+
 // Structure for clock synchronization
 #[derive(Clone, Debug)]
 struct ClockSync {
@@ -42,7 +58,7 @@ impl ClockSync {
             offset_ms: 0,
             last_update: Instant::now(),
             offset_stddev: 0.0,
-            recent_offsets: VecDeque::with_capacity(10),
+            recent_offsets: VecDeque::with_capacity(CLOCK_OFFSET_HISTORY_SIZE),
             sync_packets_sent: 0,
             sync_responses_received: 0,
         }
@@ -59,9 +75,9 @@ impl ClockSync {
         // Calculate offset: how much the remote clock is ahead of local clock
         let offset = ((t2 as i64 - t1 as i64) + (t3 as i64 - t4 as i64)) / 2;
         
-        // Add to recent offsets and keep last 10
+        // Add to recent offsets and keep last CLOCK_OFFSET_HISTORY_SIZE
         self.recent_offsets.push_back(offset);
-        if self.recent_offsets.len() > 10 {
+        if self.recent_offsets.len() > CLOCK_OFFSET_HISTORY_SIZE {
             self.recent_offsets.pop_front();
         }
         
@@ -101,12 +117,12 @@ impl ClockSync {
     
     // Check if our clock sync is fresh enough
     fn is_valid(&self) -> bool {
-        self.last_update.elapsed() < Duration::from_secs(30)
+        self.last_update.elapsed() < Duration::from_secs(CLOCK_SYNC_VALIDITY_DURATION_SECS)
     }
     
     // Check if sync quality is good (low stddev)
     fn is_reliable(&self) -> bool {
-        self.sync_responses_received >= 5 && self.offset_stddev < 50.0
+        self.sync_responses_received >= CLOCK_SYNC_MIN_SAMPLES && self.offset_stddev < CLOCK_SYNC_RELIABLE_STDDEV
     }
     
     // Get synchronization quality as a string
@@ -115,9 +131,9 @@ impl ClockSync {
             "Stale".to_string()
         } else if !self.is_reliable() {
             "Poor".to_string()
-        } else if self.offset_stddev < 10.0 {
+        } else if self.offset_stddev < CLOCK_SYNC_EXCELLENT_STDDEV {
             "Excellent".to_string()
-        } else if self.offset_stddev < 25.0 {
+        } else if self.offset_stddev < CLOCK_SYNC_GOOD_STDDEV {
             "Good".to_string()
         } else {
             "Fair".to_string()
@@ -156,7 +172,6 @@ struct IntervalLatencyStats {
     p95_latency_ms: Option<f64>,
     p99_latency_ms: Option<f64>,
     jitter_ms: Option<f64>,
-    samples_count: u64,
 }
 
 impl LatencyStats {
@@ -179,7 +194,7 @@ impl LatencyStats {
             samples_count: 0,
             jitter_ms: None,
             prev_latency_ms: None,
-            recent_latencies: VecDeque::with_capacity(1000),
+            recent_latencies: VecDeque::with_capacity(LATENCY_SAMPLE_HISTORY_SIZE),
             p95_latency_ms: None,
             p99_latency_ms: None,
             latency_buckets: buckets,
@@ -217,7 +232,7 @@ impl LatencyStats {
             
             if let Some(jitter) = self.jitter_ms {
                 // Use exponential moving average for jitter
-                self.jitter_ms = Some(0.8 * jitter + 0.2 * current_jitter);
+                self.jitter_ms = Some((1.0 - JITTER_EMA_ALPHA) * jitter + JITTER_EMA_ALPHA * current_jitter);
             } else {
                 self.jitter_ms = Some(current_jitter);
             }
@@ -226,7 +241,7 @@ impl LatencyStats {
         
         // Store recent latencies for percentiles
         self.recent_latencies.push_back(latency_ms);
-        if self.recent_latencies.len() > 1000 {
+        if self.recent_latencies.len() > LATENCY_SAMPLE_HISTORY_SIZE {
             self.recent_latencies.pop_front();
         }
         
@@ -256,7 +271,6 @@ impl LatencyStats {
         
         // Update percentiles
         self.p95_latency_ms = self.percentile(95.0);
-        self.p99_latency_ms = self.percentile(99.0);
         self.p99_latency_ms = self.percentile(99.0);
     }
     
@@ -297,7 +311,6 @@ impl LatencyStats {
                 p95_latency_ms: None,
                 p99_latency_ms: None,
                 jitter_ms: None,
-                samples_count: 0,
             };
         }
         
@@ -341,7 +354,6 @@ impl LatencyStats {
             p95_latency_ms: p95_latency,
             p99_latency_ms: p99_latency,
             jitter_ms: jitter,
-            samples_count: latencies.len() as u64,
         }
     }
     
@@ -471,10 +483,10 @@ where
 
 impl PacketStats {
     fn new() -> Self {
-        // Initialize latency buckets
+        // Initialize latency buckets (standardized to match LatencyStats)
         let buckets = [
-            "0-50ms", "50-100ms", "100-150ms", "150-200ms", "200-250ms",
-            "250-300ms", "300-350ms", "350-400ms", "400-450ms", "450-500ms",
+            "0-25ms", "25-50ms", "50-75ms", "75-100ms", "100-125ms", "125-150ms", "150-175ms", "175-200ms",
+            "200-250ms", "250-300ms", "300-350ms", "350-400ms", "400-450ms", "450-500ms",
             "500-999ms", ">1000ms",
         ]
         .iter()
@@ -835,11 +847,11 @@ fn send_terminate_packet(socket: &UdpSocket, remote_addr: &SocketAddr) -> std::i
     packet.push(PACKET_TYPE_TERMINATE);
     
     // Try to send the terminate packet multiple times for reliability
-    for _ in 0..5 {
+    for _ in 0..TERMINATE_PACKET_RETRY_COUNT {
         if let Err(e) = socket.send_to(&packet, remote_addr) {
             eprintln!("Failed to send terminate packet: {}", e);
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(TERMINATE_PACKET_RETRY_DELAY_MS));
     }
     Ok(())
 }
@@ -1010,7 +1022,7 @@ fn main() -> std::io::Result<()> {
     io::stdout().flush().unwrap();
 
     let socket = UdpSocket::bind(local_addr)?;
-    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    socket.set_read_timeout(Some(Duration::from_millis(SOCKET_READ_TIMEOUT_MS)))?;
     
     // Initialize CSV file with headers if needed
     if let Some(ref file) = csv_file {
@@ -1072,24 +1084,27 @@ fn main() -> std::io::Result<()> {
         
         // Save final statistics with all latency data included
         {
-            if let Ok(mut stats_guard) = final_stats.try_lock() {
-                // Update with the latest latency stats
-                if let Ok(latency_guard) = final_latency.try_lock() {
-                    stats_guard.update_latency_stats(&latency_guard);
+            match final_stats.lock() {
+                Ok(mut stats_guard) => {
+                    // Update with the latest latency stats
+                    if let Ok(latency_guard) = final_latency.lock() {
+                        stats_guard.update_latency_stats(&latency_guard);
+                    }
+                    
+                    // Update with the latest clock sync info
+                    if let Ok(clock_guard) = final_clock.lock() {
+                        stats_guard.update_clock_sync(&clock_guard);
+                    }
+                    
+                    let _ = save_final_stats(
+                        &stats_guard, 
+                        json_path.as_deref(),
+                        csv_path.as_deref()
+                    );
+                },
+                Err(e) => {
+                    println!("Warning: Could not acquire stats lock for final save: {}", e);
                 }
-                
-                // Update with the latest clock sync info
-                if let Ok(clock_guard) = final_clock.try_lock() {
-                    stats_guard.update_clock_sync(&clock_guard);
-                }
-                
-                let _ = save_final_stats(
-                    &stats_guard, 
-                    json_path.as_deref(),
-                    csv_path.as_deref()
-                );
-            } else {
-                println!("Warning: Could not acquire lock for final stats save");
             }
         }
         
@@ -1223,16 +1238,16 @@ fn main() -> std::io::Result<()> {
                 // Set next sync time
                 next_sync = Instant::now() + Duration::from_secs(clock_sync_interval);
                 
-                // Cleanup old pending requests (older than 10 seconds)
+                // Cleanup old pending requests (older than TIME_SYNC_REQUEST_TIMEOUT_SECS seconds)
                 if let Ok(mut requests) = time_sync_reqs.try_lock() {
                     requests.retain(|_, time| {
-                        time.elapsed() < Duration::from_secs(10)
+                        time.elapsed() < Duration::from_secs(TIME_SYNC_REQUEST_TIMEOUT_SECS)
                     });
                 }
             }
             
             // Check running flag more frequently and don't spin the CPU
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(SOCKET_READ_TIMEOUT_MS));
         }
         
     });
@@ -1428,20 +1443,25 @@ fn main() -> std::io::Result<()> {
                                 
                                 // Save stats before exit
                                 {
-                                    if let Ok(mut stats_guard) = receiver_stats.try_lock() {
-                                        // Update with latest latency and clock sync data
-                                        if let Ok(latency_guard) = receiver_latency.try_lock() {
-                                            stats_guard.update_latency_stats(&latency_guard);
+                                    match receiver_stats.lock() {
+                                        Ok(mut stats_guard) => {
+                                            // Update with latest latency and clock sync data
+                                            if let Ok(latency_guard) = receiver_latency.lock() {
+                                                stats_guard.update_latency_stats(&latency_guard);
+                                            }
+                                            if let Ok(clock_guard) = receiver_clock_sync.lock() {
+                                                stats_guard.update_clock_sync(&clock_guard);
+                                            }
+                                            
+                                            let _ = save_final_stats(
+                                                &stats_guard, 
+                                                json_path_recv.as_deref(),
+                                                csv_path_recv.as_deref()
+                                            );
+                                        },
+                                        Err(e) => {
+                                            eprintln!("Warning: Could not acquire stats lock for final save: {}", e);
                                         }
-                                        if let Ok(clock_guard) = receiver_clock_sync.try_lock() {
-                                            stats_guard.update_clock_sync(&clock_guard);
-                                        }
-                                        
-                                        let _ = save_final_stats(
-                                            &stats_guard, 
-                                            json_path_recv.as_deref(),
-                                            csv_path_recv.as_deref()
-                                        );
                                     }
                                 }
                                 
@@ -1459,7 +1479,7 @@ fn main() -> std::io::Result<()> {
                         eprintln!("Failed to receive: {}", e);
                     }
                     // Small sleep to avoid CPU spinning on non-blocking socket
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(Duration::from_millis(THREAD_SLEEP_MS));
                 }
             }
         }
@@ -1486,24 +1506,28 @@ fn main() -> std::io::Result<()> {
         let mut last_export_time = Instant::now(); // Track actual time for export interval
         
         while stats_running.load(Ordering::SeqCst) {
-            // Get updated stats
+            // Get updated stats with timeout to avoid indefinite blocking
             let stats_snapshot = {
-                if let Ok(mut stats_guard) = stats_clone.try_lock() {
-                    stats_guard.update_loss_stats();
-                    
-                    // Update latency and clock sync data for export
-                    if let Ok(latency_guard) = latency_data.try_lock() {
-                        stats_guard.update_latency_stats(&latency_guard);
+                match stats_clone.lock() {
+                    Ok(mut stats_guard) => {
+                        stats_guard.update_loss_stats();
+                        
+                        // Update latency and clock sync data for export
+                        if let Ok(latency_guard) = latency_data.lock() {
+                            stats_guard.update_latency_stats(&latency_guard);
+                        }
+                        if let Ok(clock_guard) = clock_data.lock() {
+                            stats_guard.update_clock_sync(&clock_guard);
+                        }
+                        
+                        stats_guard.clone()
+                    },
+                    Err(e) => {
+                        eprintln!("Error acquiring stats lock: {}", e);
+                        // Sleep and continue to avoid spinning
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
                     }
-                    if let Ok(clock_guard) = clock_data.try_lock() {
-                        stats_guard.update_clock_sync(&clock_guard);
-                    }
-                    
-                    stats_guard.clone()
-                } else {
-                    // If we can't get lock, skip this iteration
-                    thread::sleep(Duration::from_millis(100));
-                    continue;
                 }
             };
             
@@ -1511,23 +1535,26 @@ fn main() -> std::io::Result<()> {
             activity_update_timer += 1;
             if activity_update_timer >= 1 {
                 activity_update_timer = 0;
-                if let Ok(activity_guard) = activity_clone.try_lock() {
-                    last_activity_data = activity_guard.clone();
+                match activity_clone.lock() {
+                    Ok(activity_guard) => {
+                        last_activity_data = activity_guard.clone();
+                    },
+                    Err(_) => {
+                        // Keep using last known activity data if lock fails
+                    }
                 }
             }
             
-            // Get latency stats
-            let latency_stats_str = if let Ok(latency_guard) = latency_data.try_lock() {
-                latency_guard.get_stats_string()
-            } else {
-                "Stats unavailable".to_string()
+            // Get latency stats with error handling
+            let latency_stats_str = match latency_data.lock() {
+                Ok(latency_guard) => latency_guard.get_stats_string(),
+                Err(_) => "Latency stats unavailable".to_string(),
             };
             
-            // Get clock sync info
-            let clock_sync_info = if let Ok(clock_guard) = clock_data.try_lock() {
-                clock_guard.clone()
-            } else {
-                ClockSync::new()
+            // Get clock sync info with error handling
+            let clock_sync_info = match clock_data.lock() {
+                Ok(clock_guard) => clock_guard.clone(),
+                Err(_) => ClockSync::new(),
             };
             
             // Update the display - now in row format with no borders
@@ -1646,41 +1673,41 @@ fn main() -> std::io::Result<()> {
        // println!("Stats thread shutting down gracefully");
     });
 
-    // Wait for all threads to complete with timeout
+    // Wait for all threads to complete with proper error handling
     println!("Waiting for threads to complete...");
     
     let mut all_joined = true;
     
-    // Try to join sender thread
+    // Join sender thread with error handling
     match sender_handle.join() {
-        Ok(_) => println!(),
+        Ok(_) => println!("Sender thread completed successfully"),
         Err(e) => {
             eprintln!("Sender thread panicked: {:?}", e);
             all_joined = false;
         }
     }
     
-    // Try to join receiver thread
+    // Join receiver thread with error handling
     match receiver_handle.join() {
-        Ok(_) => println!(),
+        Ok(_) => println!("Receiver thread completed successfully"),
         Err(e) => {
             eprintln!("Receiver thread panicked: {:?}", e);
             all_joined = false;
         }
     }
     
-    // Try to join stats thread
+    // Join stats thread with error handling
     match stats_handle.join() {
-        Ok(_) => println!(),
+        Ok(_) => println!("Stats thread completed successfully"),
         Err(e) => {
             eprintln!("Stats thread panicked: {:?}", e);
             all_joined = false;
         }
     }
     
-    // Try to join clock sync thread
+    // Join clock sync thread with error handling
     match clock_sync_handle.join() {
-        Ok(_) => println!(),
+        Ok(_) => println!("Clock sync thread completed successfully"),
         Err(e) => {
             eprintln!("Clock sync thread panicked: {:?}", e);
             all_joined = false;

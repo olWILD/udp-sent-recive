@@ -27,13 +27,34 @@ const CLOCK_SYNC_EXCELLENT_STDDEV: f64 = 10.0;
 const CLOCK_SYNC_GOOD_STDDEV: f64 = 25.0;
 const LATENCY_SAMPLE_HISTORY_SIZE: usize = 1000;
 const CLOCK_OFFSET_HISTORY_SIZE: usize = 10;
-const LATENCY_BUCKET_COUNT: usize = 16;
 const TERMINATE_PACKET_RETRY_COUNT: usize = 5;
 const TERMINATE_PACKET_RETRY_DELAY_MS: u64 = 100;
 const TIME_SYNC_REQUEST_TIMEOUT_SECS: u64 = 10;
 const SOCKET_READ_TIMEOUT_MS: u64 = 100;
 const THREAD_SLEEP_MS: u64 = 10;
 const JITTER_EMA_ALPHA: f64 = 0.2; // Exponential moving average alpha for jitter calculation
+
+// Helper function to get latency bucket key efficiently
+fn get_latency_bucket_key(latency_ms: f64) -> &'static str {
+    match latency_ms as u64 {
+        0..=24 => "0-25ms",
+        25..=49 => "25-50ms",
+        50..=74 => "50-75ms",
+        75..=99 => "75-100ms",
+        100..=124 => "100-125ms",
+        125..=149 => "125-150ms",
+        150..=174 => "150-175ms",
+        175..=199 => "175-200ms",
+        200..=249 => "200-250ms",
+        250..=299 => "250-300ms",
+        300..=349 => "300-350ms",
+        350..=399 => "350-400ms",
+        400..=449 => "400-450ms",
+        450..=499 => "450-500ms",
+        500..=999 => "500-999ms",
+        _ => ">1000ms",
+    }
+}
 
 // Structure for clock synchronization
 #[derive(Clone, Debug)]
@@ -248,26 +269,9 @@ impl LatencyStats {
         // Store latency for interval calculations
         self.interval_latencies.push_back(latency_ms);
         
-        // Update latency buckets
-        let bucket = match latency_ms as u64 {
-            0..=24 => "0-25ms",
-            25..=49 => "25-50ms",
-            50..=74 => "50-75ms",
-            75..=99 => "75-100ms",
-            100..=124 => "100-125ms",
-            125..=149 => "125-150ms",
-            150..=174 => "150-175ms",
-            175..=199 => "175-200ms",
-            200..=249 => "200-250ms",
-            250..=299 => "250-300ms",
-            300..=349 => "300-350ms",
-            350..=399 => "350-400ms",
-            400..=449 => "400-450ms",
-            450..=499 => "450-500ms",
-            500..=999 => "500-999ms",
-            _ => ">1000ms",
-        };
-        *self.latency_buckets.entry(bucket.to_string()).or_insert(0) += 1;
+        // Update latency buckets more efficiently
+        let bucket_key = get_latency_bucket_key(latency_ms);
+        *self.latency_buckets.entry(bucket_key.to_string()).or_insert(0) += 1;
         
         // Update percentiles
         self.p95_latency_ms = self.percentile(95.0);
@@ -1073,14 +1077,20 @@ fn main() -> std::io::Result<()> {
     let csv_path = csv_file.clone();
     
     ctrlc::set_handler(move || {
-        println!("\nReceived Ctrl+C signal, initiating shutdown...");
+        println!("\nReceived Ctrl+C signal, initiating graceful shutdown...");
         r.store(false, Ordering::SeqCst);
         
         // Send termination packet to the remote side
         let _ = send_terminate_packet(&terminate_socket, &terminate_remote);
         
-        // Give some time for threads to notice the termination signal
-        thread::sleep(Duration::from_millis(1000));
+        // Give threads reasonable time to notice the termination signal and clean up
+        let shutdown_timeout = Duration::from_millis(2000);
+        let start_time = Instant::now();
+        
+        // Wait for threads with timeout
+        while start_time.elapsed() < shutdown_timeout {
+            thread::sleep(Duration::from_millis(100));
+        }
         
         // Save final statistics with all latency data included
         {
@@ -1108,8 +1118,7 @@ fn main() -> std::io::Result<()> {
             }
         }
         
-       // println!("Shutdown signal sent to all threads...");
-        // Don't call exit here - let main thread handle cleanup
+       // Don't call exit here - let main thread handle cleanup
     }).expect("Error setting Ctrl+C handler");
 
     // Synchronization thread if enabled
@@ -1225,13 +1234,23 @@ fn main() -> std::io::Result<()> {
                 // Time to send a clock sync packet
                 if let Ok(t1) = send_time_sync_packet(&clock_sync_socket, &clock_sync_remote) {
                     // Store the timestamp in pending requests
-                    if let Ok(mut requests) = time_sync_reqs.try_lock() {
-                        requests.insert(t1, Instant::now());
+                    match time_sync_reqs.lock() {
+                        Ok(mut requests) => {
+                            requests.insert(t1, Instant::now());
+                        },
+                        Err(_) => {
+                            // Continue without storing request if lock fails
+                        }
                     }
                     
                     // Update sync counter
-                    if let Ok(mut sync_data) = clock_sync_data.try_lock() {
-                        sync_data.sync_packets_sent += 1;
+                    match clock_sync_data.lock() {
+                        Ok(mut sync_data) => {
+                            sync_data.sync_packets_sent += 1;
+                        },
+                        Err(_) => {
+                            // Continue without updating counter if lock fails
+                        }
                     }
                 }
                 
@@ -1239,15 +1258,25 @@ fn main() -> std::io::Result<()> {
                 next_sync = Instant::now() + Duration::from_secs(clock_sync_interval);
                 
                 // Cleanup old pending requests (older than TIME_SYNC_REQUEST_TIMEOUT_SECS seconds)
-                if let Ok(mut requests) = time_sync_reqs.try_lock() {
-                    requests.retain(|_, time| {
-                        time.elapsed() < Duration::from_secs(TIME_SYNC_REQUEST_TIMEOUT_SECS)
-                    });
+                match time_sync_reqs.lock() {
+                    Ok(mut requests) => {
+                        requests.retain(|_, time| {
+                            time.elapsed() < Duration::from_secs(TIME_SYNC_REQUEST_TIMEOUT_SECS)
+                        });
+                    },
+                    Err(_) => {
+                        // Continue without cleanup if lock fails
+                    }
                 }
             }
             
-            // Check running flag more frequently and don't spin the CPU
+            // Check running flag more frequently to ensure timely shutdown
             thread::sleep(Duration::from_millis(SOCKET_READ_TIMEOUT_MS));
+            
+            // Additional check for running flag to ensure prompt shutdown
+            if !clock_sync_running.load(Ordering::SeqCst) {
+                break;
+            }
         }
         
     });
@@ -1270,6 +1299,11 @@ fn main() -> std::io::Result<()> {
         }
 
         while (count == 0 || sent_count < count) && sender_running.load(Ordering::SeqCst) {
+            // Check for termination signal before creating and sending each packet
+            if !sender_running.load(Ordering::SeqCst) {
+                break;
+            }
+            
             // Get current timestamp in milliseconds since UNIX epoch
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1287,21 +1321,29 @@ fn main() -> std::io::Result<()> {
             let data_size = 500;
             let mut remaining = data_size;
             
-            while remaining > 0 {
+            while remaining > 0 && remaining <= data_size {  // Add bounds check to prevent infinite loop
                 let chunk_size = std::cmp::min(lorem.len(), remaining);
                 packet.extend_from_slice(&lorem.as_bytes()[0..chunk_size]);
                 remaining -= chunk_size;
             }
 
-            if let Err(e) = sender_socket.send_to(&packet, &sender_remote) {
-                eprintln!("Failed to send packet: {}", e);
-            } else {
-                // Update activity tracker
-                sender_activity.lock().unwrap().update_sent(seq_num);
-                
-                let mut stats = sender_stats.lock().unwrap();
-                stats.sent += 1;
-                sent_count += 1;
+            match sender_socket.send_to(&packet, &sender_remote) {
+                Ok(_) => {
+                    // Update activity tracker
+                    if let Ok(mut activity) = sender_activity.lock() {
+                        activity.update_sent(seq_num);
+                    }
+                    
+                    if let Ok(mut stats) = sender_stats.lock() {
+                        stats.sent += 1;
+                    }
+                    sent_count += 1;
+                },
+                Err(e) => {
+                    eprintln!("Failed to send packet: {}", e);
+                    // Add small delay on send errors to prevent spinning
+                    thread::sleep(Duration::from_millis(10));
+                }
             }
 
             seq_num += 1;
@@ -1310,7 +1352,7 @@ fn main() -> std::io::Result<()> {
             if count > 0 && sent_count >= count {
                 println!("\nPacket count limit reached, notifying remote side...");
                 sender_running.store(false, Ordering::SeqCst);
-                send_terminate_packet(&sender_socket, &sender_remote).unwrap();
+                let _ = send_terminate_packet(&sender_socket, &sender_remote);
                 break;
             }
             
@@ -1368,7 +1410,10 @@ fn main() -> std::io::Result<()> {
                                 let mut latency_ms = None;
                                 
                                 // Check if we have valid clock synchronization
-                                let clock_sync_info = receiver_clock_sync.lock().unwrap();
+                                let clock_sync_info = match receiver_clock_sync.lock() {
+                                    Ok(clock_guard) => clock_guard.clone(),
+                                    Err(_) => ClockSync::new(), // Use default if lock fails
+                                };
                                 if clock_sync_info.is_valid() {
                                     // Convert remote timestamp to local time using our offset
                                     let adjusted_remote_time = clock_sync_info.remote_to_local(remote_send_time);
@@ -1378,18 +1423,38 @@ fn main() -> std::io::Result<()> {
                                         let one_way_latency = current_time - adjusted_remote_time;
                                         latency_ms = Some(one_way_latency as f64);
                                         
-                                        // Update latency statistics
-                                        receiver_latency.lock().unwrap().add_sample(one_way_latency as f64);
+                                        // Update latency statistics with error handling
+                                        match receiver_latency.lock() {
+                                            Ok(mut latency_stats) => {
+                                                latency_stats.add_sample(one_way_latency as f64);
+                                            },
+                                            Err(_) => {
+                                                // Continue without updating latency stats if lock fails
+                                            }
+                                        }
                                     }
                                 }
                                 
-                                // Update activity tracker
-                                receiver_activity.lock().unwrap().update_received(seq_num, latency_ms);
+                                // Update activity tracker with better error handling
+                                match receiver_activity.lock() {
+                                    Ok(mut activity) => {
+                                        activity.update_received(seq_num, latency_ms);
+                                    },
+                                    Err(_) => {
+                                        // Continue without updating activity if lock fails
+                                    }
+                                }
                                 
-                                // Process packet for sequence tracking
-                                let mut stats = receiver_stats.lock().unwrap();
-                                stats.process_sequence(seq_num);
-                                stats.update_loss_stats();
+                                // Process packet for sequence tracking with better error handling
+                                match receiver_stats.lock() {
+                                    Ok(mut stats) => {
+                                        stats.process_sequence(seq_num);
+                                        stats.update_loss_stats();
+                                    },
+                                    Err(_) => {
+                                        // Continue processing other packets if stats lock fails
+                                    }
+                                }
                             },
                             
                             PACKET_TYPE_TIME_SYNC if size >= 9 => {
@@ -1425,14 +1490,23 @@ fn main() -> std::io::Result<()> {
                                     .as_millis() as u64;
                                 
                                 // Check if this is a response to our request
-                                let mut time_reqs = receiver_time_reqs.lock().unwrap();
+                                let mut time_reqs = match receiver_time_reqs.lock() {
+                                    Ok(reqs) => reqs,
+                                    Err(_) => continue, // Skip this response if we can't access requests
+                                };
                                 if time_reqs.contains_key(&t1) {
                                     // Remove the request from pending
                                     time_reqs.remove(&t1);
                                     
                                     // Process timestamps to calculate clock offset
-                                    let mut clock_sync_data = receiver_clock_sync.lock().unwrap();
-                                    clock_sync_data.process_sync_response(t1, t2, t3, t4);
+                                    match receiver_clock_sync.lock() {
+                                        Ok(mut clock_sync_data) => {
+                                            clock_sync_data.process_sync_response(t1, t2, t3, t4);
+                                        },
+                                        Err(_) => {
+                                            // Continue without updating clock sync if lock fails
+                                        }
+                                    }
                                 }
                             },
                             
@@ -1531,13 +1605,18 @@ fn main() -> std::io::Result<()> {
                 }
             };
             
-            // Get activity status - only update once per second
+            // Get activity status - only update once per second and extract needed data
             activity_update_timer += 1;
             if activity_update_timer >= 1 {
                 activity_update_timer = 0;
                 match activity_clone.lock() {
                     Ok(activity_guard) => {
-                        last_activity_data = activity_guard.clone();
+                        // Extract only needed fields to avoid full clone
+                        last_activity_data.last_sent = activity_guard.last_sent;
+                        last_activity_data.last_received = activity_guard.last_received;
+                        last_activity_data.last_sent_time = activity_guard.last_sent_time;
+                        last_activity_data.last_received_time = activity_guard.last_received_time;
+                        last_activity_data.last_latency_ms = activity_guard.last_latency_ms;
                     },
                     Err(_) => {
                         // Keep using last known activity data if lock fails
@@ -1545,9 +1624,16 @@ fn main() -> std::io::Result<()> {
                 }
             }
             
-            // Get latency stats with error handling
+            // Get latency stats with cached string to avoid frequent formatting
             let latency_stats_str = match latency_data.lock() {
-                Ok(latency_guard) => latency_guard.get_stats_string(),
+                Ok(latency_guard) => {
+                    // Only format stats string if we have new data
+                    if latency_guard.samples_count > 0 {
+                        latency_guard.get_stats_string()
+                    } else {
+                        "No latency data yet".to_string()
+                    }
+                },
                 Err(_) => "Latency stats unavailable".to_string(),
             };
             

@@ -1082,8 +1082,8 @@ fn main() -> std::io::Result<()> {
         // Send termination packet to the remote side
         let _ = send_terminate_packet(&terminate_socket, &terminate_remote);
         
-        // Give threads reasonable time to notice the termination signal and clean up
-        let shutdown_timeout = Duration::from_millis(2000);
+        // Give threads more time to notice the termination signal and clean up
+        let shutdown_timeout = Duration::from_millis(5000); // Increased from 2000ms to 5000ms
         let start_time = Instant::now();
         
         // Wait for threads with timeout
@@ -1092,6 +1092,7 @@ fn main() -> std::io::Result<()> {
         }
         
         // Save final statistics with all latency data included
+        println!("Saving final statistics from Ctrl+C handler...");
         {
             match final_stats.lock() {
                 Ok(mut stats_guard) => {
@@ -1105,14 +1106,17 @@ fn main() -> std::io::Result<()> {
                         stats_guard.update_clock_sync(&clock_guard);
                     }
                     
-                    let _ = save_final_stats(
+                    match save_final_stats(
                         &stats_guard, 
                         json_path.as_deref(),
                         csv_path.as_deref()
-                    );
+                    ) {
+                        Ok(_) => println!("Final statistics successfully saved from Ctrl+C handler"),
+                        Err(e) => eprintln!("Error saving final statistics from Ctrl+C handler: {e}"),
+                    }
                 },
                 Err(e) => {
-                    println!("Warning: Could not acquire stats lock for final save: {e}");
+                    eprintln!("Warning: Could not acquire stats lock for final save in Ctrl+C handler: {e}");
                 }
             }
         }
@@ -1287,6 +1291,10 @@ fn main() -> std::io::Result<()> {
     let sender_running = Arc::clone(&running);
     let sender_sync = Arc::clone(&synchronized);
     let sender_remote = remote_addr;
+    let sender_latency = Arc::clone(&latency_stats);
+    let sender_clock_sync = Arc::clone(&clock_sync);
+    let sender_json_path = json_file.clone();
+    let sender_csv_path = csv_file.clone();
     
     let sender_handle = thread::spawn(move || {
         let mut seq_num: u64 = 0;
@@ -1349,7 +1357,32 @@ fn main() -> std::io::Result<()> {
             
             // Check if we've reached the packet count limit
             if count > 0 && sent_count >= count {
-                println!("\nPacket count limit reached, notifying remote side...");
+                println!("\nPacket count limit reached, saving final statistics and notifying remote side...");
+                
+                // Save final statistics before terminating
+                {
+                    match sender_stats.lock() {
+                        Ok(mut stats_guard) => {
+                            // Update with latest latency and clock sync data
+                            if let Ok(latency_guard) = sender_latency.lock() {
+                                stats_guard.update_latency_stats(&latency_guard);
+                            }
+                            if let Ok(clock_guard) = sender_clock_sync.lock() {
+                                stats_guard.update_clock_sync(&clock_guard);
+                            }
+                            
+                            let _ = save_final_stats(
+                                &stats_guard, 
+                                sender_json_path.as_deref(),
+                                sender_csv_path.as_deref()
+                            );
+                        },
+                        Err(e) => {
+                            eprintln!("Warning: Could not acquire stats lock for final save: {e}");
+                        }
+                    }
+                }
+                
                 sender_running.store(false, Ordering::SeqCst);
                 let _ = send_terminate_packet(&sender_socket, &sender_remote);
                 break;
@@ -1801,6 +1834,31 @@ fn main() -> std::io::Result<()> {
         println!("All threads completed successfully");
     } else {
         println!("Some threads had issues, but shutdown completed");
+    }
+    
+    // Final backup statistics save to ensure we don't lose data
+    println!("Performing final backup statistics save...");
+    {
+        match stats.lock() {
+            Ok(mut stats_guard) => {
+                // Update with latest latency and clock sync data
+                if let Ok(latency_guard) = latency_stats.lock() {
+                    stats_guard.update_latency_stats(&latency_guard);
+                }
+                if let Ok(clock_guard) = clock_sync.lock() {
+                    stats_guard.update_clock_sync(&clock_guard);
+                }
+                
+                let _ = save_final_stats(
+                    &stats_guard, 
+                    json_file.as_deref(),
+                    csv_file.as_deref()
+                );
+            },
+            Err(e) => {
+                eprintln!("Warning: Could not acquire stats lock for backup final save: {e}");
+            }
+        }
     }
     
     // Final cleanup - close socket explicitly

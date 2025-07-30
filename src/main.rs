@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Write, Read, Seek};
 use std::net::{UdpSocket, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
@@ -33,6 +33,12 @@ const TIME_SYNC_REQUEST_TIMEOUT_SECS: u64 = 10;
 const SOCKET_READ_TIMEOUT_MS: u64 = 100;
 const THREAD_SLEEP_MS: u64 = 10;
 const JITTER_EMA_ALPHA: f64 = 0.2; // Exponential moving average alpha for jitter calculation
+
+// Long-running operation constants
+const MAX_FILE_SIZE_MB: u64 = 100; // Maximum file size before rotation
+const FILE_SAVE_RETRY_COUNT: usize = 3;
+const FILE_SAVE_RETRY_DELAY_MS: u64 = 500;
+const SHUTDOWN_TIMEOUT_MS: u64 = 5000; // Increased timeout for long-running cleanup
 
 // Helper function to get latency bucket key efficiently
 fn get_latency_bucket_key(latency_ms: f64) -> &'static str {
@@ -484,6 +490,67 @@ where
     }
 }
 
+// Helper function to check if file needs rotation
+fn should_rotate_file(file_path: &str) -> bool {
+    if let Ok(metadata) = fs::metadata(file_path) {
+        let size_mb = metadata.len() / (1024 * 1024);
+        size_mb >= MAX_FILE_SIZE_MB
+    } else {
+        false
+    }
+}
+
+// Helper function to rotate file by renaming it with timestamp
+fn rotate_file(file_path: &str) -> std::io::Result<()> {
+    if std::path::Path::new(file_path).exists() {
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let extension = std::path::Path::new(file_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        let stem = std::path::Path::new(file_path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("backup");
+        
+        let backup_path = if extension.is_empty() {
+            format!("{}_{}", file_path, timestamp)
+        } else {
+            format!("{}_{}.{}", stem, timestamp, extension)
+        };
+        
+        println!("Rotating file {} to {}", file_path, backup_path);
+        fs::rename(file_path, backup_path)?;
+    }
+    Ok(())
+}
+
+// Retry wrapper for file operations
+fn retry_operation<F, T>(mut operation: F, operation_name: &str) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    let mut last_error = None;
+    
+    for attempt in 1..=FILE_SAVE_RETRY_COUNT {
+        match operation() {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                eprintln!("Attempt {}/{} failed for {}: {}", attempt, FILE_SAVE_RETRY_COUNT, operation_name, e);
+                last_error = Some(e);
+                if attempt < FILE_SAVE_RETRY_COUNT {
+                    thread::sleep(Duration::from_millis(FILE_SAVE_RETRY_DELAY_MS));
+                }
+            }
+        }
+    }
+    
+    Err(last_error.unwrap_or_else(|| std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("All {} attempts failed for {}", FILE_SAVE_RETRY_COUNT, operation_name)
+    )))
+}
+
 impl PacketStats {
     fn new() -> Self {
         // Initialize latency buckets (standardized to match LatencyStats)
@@ -624,81 +691,143 @@ impl PacketStats {
 }
 
 fn export_to_json(stats: &PacketStats, json_file: &str) -> std::io::Result<()> {
-    // Create the directory if it doesn't exist
-    if let Some(parent) = std::path::Path::new(json_file).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    
-    // Convert stats to JSON export format
-    let export_stats = stats.to_json_export_stats();
-    let stats_json = serde_json::to_value(export_stats)?;
-    
-    // Read existing JSON array or create a new one
-    let json_data = if std::path::Path::new(json_file).exists() {
-        match fs::read_to_string(json_file) {
-            Ok(content) if !content.trim().is_empty() => {
-                match serde_json::from_str::<Value>(&content) {
-                    Ok(Value::Array(mut arr)) => {
-                        // Add new stats to existing array
-                        arr.push(stats_json);
-                        Value::Array(arr)
+    retry_operation(|| {
+        // Check if file needs rotation before writing
+        if should_rotate_file(json_file) {
+            rotate_file(json_file)?;
+        }
+        
+        // Create the directory if it doesn't exist
+        if let Some(parent) = std::path::Path::new(json_file).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        // Convert stats to JSON export format
+        let export_stats = stats.to_json_export_stats();
+        let stats_json = serde_json::to_value(export_stats)?;
+        
+        // For large files, use append-only approach to avoid reading entire file
+        let file_exists = std::path::Path::new(json_file).exists();
+        
+        if !file_exists {
+            // New file - create with array containing single entry
+            let json_data = json!([stats_json]);
+            let mut file = File::create(json_file)?;
+            let json_str = serde_json::to_string_pretty(&json_data)?;
+            file.write_all(json_str.as_bytes())?;
+            file.flush()?;
+        } else {
+            // Existing file - check if it's small enough to read entirely
+            let metadata = fs::metadata(json_file)?;
+            let file_size_mb = metadata.len() / (1024 * 1024);
+            
+            if file_size_mb < 10 { // Small file - use existing logic
+                let json_data = match fs::read_to_string(json_file) {
+                    Ok(content) if !content.trim().is_empty() => {
+                        match serde_json::from_str::<Value>(&content) {
+                            Ok(Value::Array(mut arr)) => {
+                                arr.push(stats_json);
+                                Value::Array(arr)
+                            },
+                            _ => {
+                                json!([stats_json])
+                            }
+                        }
                     },
                     _ => {
-                        // If not a valid array, start a new one
                         json!([stats_json])
                     }
+                };
+                
+                let temp_file = format!("{json_file}.tmp");
+                {
+                    let mut file = File::create(&temp_file)?;
+                    let json_str = serde_json::to_string_pretty(&json_data)?;
+                    file.write_all(json_str.as_bytes())?;
+                    file.flush()?;
                 }
-            },
-            _ => {
-                // Empty or invalid file, start fresh
-                json!([stats_json])
+                fs::rename(temp_file, json_file)?;
+            } else {
+                // Large file - use append-only approach by modifying the end
+                // Read last few bytes to check format and append
+                let mut file = OpenOptions::new().read(true).write(true).open(json_file)?;
+                
+                // Seek to end and read last few characters
+                file.seek(std::io::SeekFrom::End(-10))?;
+                let mut buffer = [0; 10];
+                file.read(&mut buffer)?;
+                
+                // Check if file ends with ']' (valid JSON array)
+                let content = String::from_utf8_lossy(&buffer);
+                if content.trim_end().ends_with(']') {
+                    // File is a valid JSON array - replace ']' with ',new_entry]'
+                    file.seek(std::io::SeekFrom::End(0))?;
+                    let mut pos = file.seek(std::io::SeekFrom::Current(0))?;
+                    
+                    // Find the last ']'
+                    while pos > 0 {
+                        pos -= 1;
+                        file.seek(std::io::SeekFrom::Start(pos))?;
+                        let mut byte = [0; 1];
+                        file.read_exact(&mut byte)?;
+                        if byte[0] == b']' {
+                            // Found the closing bracket - replace with comma and new entry
+                            file.seek(std::io::SeekFrom::Start(pos))?;
+                            let new_entry_str = format!(",\n{}\n]", serde_json::to_string_pretty(&stats_json)?);
+                            file.write_all(new_entry_str.as_bytes())?;
+                            file.flush()?;
+                            break;
+                        }
+                    }
+                } else {
+                    // File format is unknown - rotate and start fresh
+                    drop(file); // Close file before rotating
+                    rotate_file(json_file)?;
+                    let json_data = json!([stats_json]);
+                    let mut new_file = File::create(json_file)?;
+                    let json_str = serde_json::to_string_pretty(&json_data)?;
+                    new_file.write_all(json_str.as_bytes())?;
+                    new_file.flush()?;
+                }
             }
         }
-    } else {
-        // File doesn't exist, create new array
-        json!([stats_json])
-    };
-    
-    // Write the updated JSON array to a temporary file
-    let temp_file = format!("{json_file}.tmp");
-    {
-        let mut file = File::create(&temp_file)?;
-        let json_str = serde_json::to_string_pretty(&json_data)?;
-        file.write_all(json_str.as_bytes())?;
-        file.flush()?;
-    }
-    
-    // Rename the temp file to the target file (atomic operation)
-    fs::rename(temp_file, json_file)?;
-    
-    Ok(())
+        
+        Ok(())
+    }, "JSON export")
 }
 
 fn export_to_csv(stats: &PacketStats, csv_file: &str, header_needed: bool) -> std::io::Result<()> {
-    // Create the directory if it doesn't exist
-    if let Some(parent) = std::path::Path::new(csv_file).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    
-    let file_exists = std::path::Path::new(csv_file).exists();
-    
-    // Always include headers if the file doesn't exist or headers are explicitly requested
-    let include_headers = !file_exists || header_needed;
-    
-    let mut wtr = csv::WriterBuilder::new()
-        .has_headers(include_headers)
-        .from_writer(OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(file_exists && !header_needed)
-            .truncate(!file_exists || header_needed)
-            .open(csv_file)?);
+    retry_operation(|| {
+        // Check if file needs rotation before writing
+        if should_rotate_file(csv_file) {
+            rotate_file(csv_file)?;
+        }
+        
+        // Create the directory if it doesn't exist
+        if let Some(parent) = std::path::Path::new(csv_file).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        let file_exists = std::path::Path::new(csv_file).exists();
+        
+        // Always include headers if the file doesn't exist or headers are explicitly requested
+        let include_headers = !file_exists || header_needed;
+        
+        let mut wtr = csv::WriterBuilder::new()
+            .has_headers(include_headers)
+            .from_writer(OpenOptions::new()
+                .write(true)
+                .create(true)
+                .append(file_exists && !header_needed)
+                .truncate(!file_exists || header_needed)
+                .open(csv_file)?);
 
-    // Convert to CSV export format
-    let export_stats = stats.to_csv_export_stats();
-    wtr.serialize(export_stats)?;
-    wtr.flush()?;
-    Ok(())
+        // Convert to CSV export format
+        let export_stats = stats.to_csv_export_stats();
+        wtr.serialize(export_stats)?;
+        wtr.flush()?;
+        Ok(())
+    }, "CSV export")
 }
 
 // Function to save interval statistics (only delta from last export)
@@ -769,25 +898,59 @@ fn save_interval_stats(
 fn save_final_stats(stats: &PacketStats, json_file: Option<&str>, csv_file: Option<&str>) -> std::io::Result<()> {
     println!("=== SAVING FINAL STATISTICS BEFORE EXIT ===");
     
+    let mut json_success = true;
+    let mut csv_success = true;
+    
     if let Some(file) = json_file {
-        if let Err(e) = export_to_json(stats, file) {
-            eprintln!("Error saving final JSON stats: {e}");
-        } else {
-            println!("Final statistics saved to JSON file: {file}");
+        match retry_operation(|| export_to_json(stats, file), "final JSON save") {
+            Ok(()) => {
+                println!("Final statistics saved to JSON file: {file}");
+            },
+            Err(e) => {
+                eprintln!("CRITICAL: Failed to save final JSON stats after all retries: {e}");
+                json_success = false;
+                
+                // Try to save to backup location
+                let backup_file = format!("{file}.emergency_backup");
+                if let Ok(backup_json) = serde_json::to_string_pretty(&stats.to_json_export_stats()) {
+                    if std::fs::write(&backup_file, backup_json).is_ok() {
+                        println!("Emergency backup saved to: {backup_file}");
+                    }
+                }
+            }
         }
     }
     
     if let Some(file) = csv_file {
-        // Use header_needed=true to ensure headers are present in a new file
-        if let Err(e) = export_to_csv(stats, file, !std::path::Path::new(file).exists()) {
-            eprintln!("Error saving final CSV stats: {e}");
-        } else {
-            println!("Final statistics saved to CSV file: {file}");
+        match retry_operation(|| export_to_csv(stats, file, !std::path::Path::new(file).exists()), "final CSV save") {
+            Ok(()) => {
+                println!("Final statistics saved to CSV file: {file}");
+            },
+            Err(e) => {
+                eprintln!("CRITICAL: Failed to save final CSV stats after all retries: {e}");
+                csv_success = false;
+                
+                // Try to save to backup location
+                let backup_file = format!("{file}.emergency_backup");
+                if let Ok(mut backup_writer) = csv::Writer::from_path(&backup_file) {
+                    if backup_writer.serialize(stats.to_csv_export_stats()).is_ok() {
+                        println!("Emergency backup saved to: {backup_file}");
+                    }
+                }
+            }
         }
     }
     
-    println!("=== FINAL STATISTICS SAVED ===");
-    Ok(())
+    if json_success && csv_success {
+        println!("=== ALL FINAL STATISTICS SAVED SUCCESSFULLY ===");
+        Ok(())
+    } else {
+        println!("=== FINAL STATISTICS SAVE COMPLETED WITH SOME ERRORS ===");
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Some final statistics could not be saved"
+        ))
+    }
 }
 
 // Track the latest packet activity
@@ -1083,36 +1246,51 @@ fn main() -> std::io::Result<()> {
         let _ = send_terminate_packet(&terminate_socket, &terminate_remote);
         
         // Give threads reasonable time to notice the termination signal and clean up
-        let shutdown_timeout = Duration::from_millis(2000);
+        let shutdown_timeout = Duration::from_millis(SHUTDOWN_TIMEOUT_MS);
         let start_time = Instant::now();
         
-        // Wait for threads with timeout
+        println!("Waiting for threads to complete shutdown...");
+        
+        // Wait for threads with timeout and progress reporting
         while start_time.elapsed() < shutdown_timeout {
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(200));
+            
+            // Show progress every 2 seconds
+            if start_time.elapsed().as_millis() % 2000 < 200 {
+                let elapsed = start_time.elapsed().as_secs();
+                let total = shutdown_timeout.as_secs();
+                println!("Shutdown progress: {}s/{}s", elapsed, total);
+            }
         }
+        
+        println!("Timeout reached, proceeding with final statistics save...");
         
         // Save final statistics with all latency data included
         {
-            match final_stats.lock() {
+            match final_stats.try_lock() {
                 Ok(mut stats_guard) => {
                     // Update with the latest latency stats
-                    if let Ok(latency_guard) = final_latency.lock() {
+                    if let Ok(latency_guard) = final_latency.try_lock() {
                         stats_guard.update_latency_stats(&latency_guard);
                     }
                     
                     // Update with the latest clock sync info
-                    if let Ok(clock_guard) = final_clock.lock() {
+                    if let Ok(clock_guard) = final_clock.try_lock() {
                         stats_guard.update_clock_sync(&clock_guard);
                     }
                     
-                    let _ = save_final_stats(
+                    match save_final_stats(
                         &stats_guard, 
                         json_path.as_deref(),
                         csv_path.as_deref()
-                    );
+                    ) {
+                        Ok(()) => println!("Final statistics saved successfully"),
+                        Err(e) => eprintln!("Final statistics save encountered errors: {e}"),
+                    }
                 },
                 Err(e) => {
                     println!("Warning: Could not acquire stats lock for final save: {e}");
+                    println!("Stats may have been saved by another thread or could be incomplete");
                 }
             }
         }
@@ -1227,13 +1405,14 @@ fn main() -> std::io::Result<()> {
     let clock_sync_handle = thread::spawn(move || {
         // Start right away with first sync
         let mut next_sync = Instant::now();
+        let mut cleanup_counter = 0;
         
         while clock_sync_running.load(Ordering::SeqCst) {
             if Instant::now() >= next_sync {
                 // Time to send a clock sync packet
                 if let Ok(t1) = send_time_sync_packet(&clock_sync_socket, &clock_sync_remote) {
                     // Store the timestamp in pending requests
-                    match time_sync_reqs.lock() {
+                    match time_sync_reqs.try_lock() {
                         Ok(mut requests) => {
                             requests.insert(t1, Instant::now());
                         },
@@ -1243,7 +1422,7 @@ fn main() -> std::io::Result<()> {
                     }
                     
                     // Update sync counter
-                    match clock_sync_data.lock() {
+                    match clock_sync_data.try_lock() {
                         Ok(mut sync_data) => {
                             sync_data.sync_packets_sent += 1;
                         },
@@ -1256,12 +1435,32 @@ fn main() -> std::io::Result<()> {
                 // Set next sync time
                 next_sync = Instant::now() + Duration::from_secs(clock_sync_interval);
                 
-                // Cleanup old pending requests (older than TIME_SYNC_REQUEST_TIMEOUT_SECS seconds)
-                match time_sync_reqs.lock() {
+                // Increment cleanup counter
+                cleanup_counter += 1;
+            }
+            
+            // Cleanup old pending requests more frequently in long-running scenarios
+            if cleanup_counter >= 3 { // Clean up every 3 sync cycles
+                cleanup_counter = 0;
+                
+                match time_sync_reqs.try_lock() {
                     Ok(mut requests) => {
+                        let before_count = requests.len();
                         requests.retain(|_, time| {
                             time.elapsed() < Duration::from_secs(TIME_SYNC_REQUEST_TIMEOUT_SECS)
                         });
+                        let after_count = requests.len();
+                        
+                        // Log cleanup if we removed items (helps with debugging long runs)
+                        if before_count > after_count {
+                            println!("Cleaned up {} expired time sync requests ({} -> {})", 
+                                   before_count - after_count, before_count, after_count);
+                        }
+                        
+                        // If we have too many pending requests, warn about potential issues
+                        if requests.len() > 100 {
+                            println!("Warning: Large number of pending time sync requests: {}", requests.len());
+                        }
                     },
                     Err(_) => {
                         // Continue without cleanup if lock fails
@@ -1278,6 +1477,7 @@ fn main() -> std::io::Result<()> {
             }
         }
         
+        println!("Clock sync thread shutting down gracefully");
     });
 
     // Sender thread
@@ -1489,16 +1689,17 @@ fn main() -> std::io::Result<()> {
                                     .as_millis() as u64;
                                 
                                 // Check if this is a response to our request
-                                let mut time_reqs = match receiver_time_reqs.lock() {
+                                let mut time_reqs = match receiver_time_reqs.try_lock() {
                                     Ok(reqs) => reqs,
                                     Err(_) => continue, // Skip this response if we can't access requests
                                 };
                                 if time_reqs.contains_key(&t1) {
                                     // Remove the request from pending
                                     time_reqs.remove(&t1);
+                                    drop(time_reqs); // Release lock before processing
                                     
                                     // Process timestamps to calculate clock offset
-                                    match receiver_clock_sync.lock() {
+                                    match receiver_clock_sync.try_lock() {
                                         Ok(mut clock_sync_data) => {
                                             clock_sync_data.process_sync_response(t1, t2, t3, t4);
                                         },
@@ -1514,23 +1715,26 @@ fn main() -> std::io::Result<()> {
                                 println!("\nReceived termination signal from remote side...");
                                 receiver_running.store(false, Ordering::SeqCst);
                                 
-                                // Save stats before exit
+                                // Save stats before exit with improved error handling
                                 {
-                                    match receiver_stats.lock() {
+                                    match receiver_stats.try_lock() {
                                         Ok(mut stats_guard) => {
                                             // Update with latest latency and clock sync data
-                                            if let Ok(latency_guard) = receiver_latency.lock() {
+                                            if let Ok(latency_guard) = receiver_latency.try_lock() {
                                                 stats_guard.update_latency_stats(&latency_guard);
                                             }
-                                            if let Ok(clock_guard) = receiver_clock_sync.lock() {
+                                            if let Ok(clock_guard) = receiver_clock_sync.try_lock() {
                                                 stats_guard.update_clock_sync(&clock_guard);
                                             }
                                             
-                                            let _ = save_final_stats(
+                                            match save_final_stats(
                                                 &stats_guard, 
                                                 json_path_recv.as_deref(),
                                                 csv_path_recv.as_deref()
-                                            );
+                                            ) {
+                                                Ok(()) => println!("Final statistics saved successfully on termination"),
+                                                Err(e) => eprintln!("Warning: Final statistics save had errors: {e}"),
+                                            }
                                         },
                                         Err(e) => {
                                             eprintln!("Warning: Could not acquire stats lock for final save: {e}");
@@ -1538,7 +1742,7 @@ fn main() -> std::io::Result<()> {
                                     }
                                 }
                                 
-                                //println!("Receiver thread shutting down gracefully...");
+                                println!("Receiver thread shutting down gracefully...");
                                 return; // Exit receiver thread gracefully
                             },
                             
@@ -1756,51 +1960,149 @@ fn main() -> std::io::Result<()> {
        // println!("Stats thread shutting down gracefully");
     });
 
-    // Wait for all threads to complete with proper error handling
+    // Wait for all threads to complete with proper error handling and timeouts
     println!("Waiting for threads to complete...");
     
     let mut all_joined = true;
+    let individual_timeout = Duration::from_millis(SHUTDOWN_TIMEOUT_MS / 4); // Give each thread 1/4 of total timeout
     
-    // Join sender thread with error handling
-    match sender_handle.join() {
-        Ok(_) => println!("Sender thread completed successfully"),
-        Err(e) => {
-            eprintln!("Sender thread panicked: {e:?}");
-            all_joined = false;
+    // Join sender thread with timeout using thread::spawn
+    println!("Waiting for sender thread...");
+    let sender_result = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle_tx = tx.clone();
+        
+        std::thread::spawn(move || {
+            let result = sender_handle.join();
+            let _ = handle_tx.send(result);
+        });
+        
+        match rx.recv_timeout(individual_timeout) {
+            Ok(Ok(_)) => {
+                println!("Sender thread completed successfully");
+                true
+            },
+            Ok(Err(e)) => {
+                eprintln!("Sender thread panicked: {e:?}");
+                false
+            },
+            Err(_) => {
+                eprintln!("Sender thread join timed out");
+                false
+            }
         }
-    }
+    };
+    all_joined &= sender_result;
     
-    // Join receiver thread with error handling
-    match receiver_handle.join() {
-        Ok(_) => println!("Receiver thread completed successfully"),
-        Err(e) => {
-            eprintln!("Receiver thread panicked: {e:?}");
-            all_joined = false;
+    // Join receiver thread with timeout
+    println!("Waiting for receiver thread...");
+    let receiver_result = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle_tx = tx.clone();
+        
+        std::thread::spawn(move || {
+            let result = receiver_handle.join();
+            let _ = handle_tx.send(result);
+        });
+        
+        match rx.recv_timeout(individual_timeout) {
+            Ok(Ok(_)) => {
+                println!("Receiver thread completed successfully");
+                true
+            },
+            Ok(Err(e)) => {
+                eprintln!("Receiver thread panicked: {e:?}");
+                false
+            },
+            Err(_) => {
+                eprintln!("Receiver thread join timed out");
+                false
+            }
         }
-    }
+    };
+    all_joined &= receiver_result;
     
-    // Join stats thread with error handling
-    match stats_handle.join() {
-        Ok(_) => println!("Stats thread completed successfully"),
-        Err(e) => {
-            eprintln!("Stats thread panicked: {e:?}");
-            all_joined = false;
+    // Join stats thread with timeout
+    println!("Waiting for stats thread...");
+    let stats_result = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle_tx = tx.clone();
+        
+        std::thread::spawn(move || {
+            let result = stats_handle.join();
+            let _ = handle_tx.send(result);
+        });
+        
+        match rx.recv_timeout(individual_timeout) {
+            Ok(Ok(_)) => {
+                println!("Stats thread completed successfully");
+                true
+            },
+            Ok(Err(e)) => {
+                eprintln!("Stats thread panicked: {e:?}");
+                false
+            },
+            Err(_) => {
+                eprintln!("Stats thread join timed out");
+                false
+            }
         }
-    }
+    };
+    all_joined &= stats_result;
     
-    // Join clock sync thread with error handling
-    match clock_sync_handle.join() {
-        Ok(_) => println!("Clock sync thread completed successfully"),
-        Err(e) => {
-            eprintln!("Clock sync thread panicked: {e:?}");
-            all_joined = false;
+    // Join clock sync thread with timeout
+    println!("Waiting for clock sync thread...");
+    let clock_result = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle_tx = tx.clone();
+        
+        std::thread::spawn(move || {
+            let result = clock_sync_handle.join();
+            let _ = handle_tx.send(result);
+        });
+        
+        match rx.recv_timeout(individual_timeout) {
+            Ok(Ok(_)) => {
+                println!("Clock sync thread completed successfully");
+                true
+            },
+            Ok(Err(e)) => {
+                eprintln!("Clock sync thread panicked: {e:?}");
+                false
+            },
+            Err(_) => {
+                eprintln!("Clock sync thread join timed out");
+                false
+            }
         }
-    }
+    };
+    all_joined &= clock_result;
     
     if all_joined {
         println!("All threads completed successfully");
     } else {
-        println!("Some threads had issues, but shutdown completed");
+        println!("Some threads had issues or timed out, but shutdown completed");
+        
+        // Final attempt to save statistics if threads didn't complete properly
+        println!("Attempting final statistics save as safety measure...");
+        match stats.try_lock() {
+            Ok(mut stats_guard) => {
+                if let Ok(latency_guard) = latency_stats.try_lock() {
+                    stats_guard.update_latency_stats(&latency_guard);
+                }
+                if let Ok(clock_guard) = clock_sync.try_lock() {
+                    stats_guard.update_clock_sync(&clock_guard);
+                }
+                
+                match save_final_stats(&stats_guard, json_file.as_deref(), csv_file.as_deref()) {
+                    Ok(()) => println!("Final safety save completed successfully"),
+                    Err(e) => eprintln!("Final safety save failed: {e}"),
+                }
+            },
+            Err(_) => {
+                println!("Could not acquire final stats lock for safety save");
+            }
+        }
     }
     
     // Final cleanup - close socket explicitly

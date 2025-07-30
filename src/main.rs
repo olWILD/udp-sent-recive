@@ -18,6 +18,10 @@ const PACKET_TYPE_DATA: u8 = 3;
 const PACKET_TYPE_TERMINATE: u8 = 4;
 const PACKET_TYPE_TIME_SYNC: u8 = 5;          // Packet for time synchronization
 const PACKET_TYPE_TIME_SYNC_RESP: u8 = 6;     // Response to time sync packet
+const PACKET_TYPE_FILE_TRANSFER_START: u8 = 7; // Start file transfer
+const PACKET_TYPE_FILE_TRANSFER_CHUNK: u8 = 8; // File data chunk
+const PACKET_TYPE_FILE_TRANSFER_ACK: u8 = 9;   // Acknowledgment for chunk
+const PACKET_TYPE_FILE_TRANSFER_COMPLETE: u8 = 10; // File transfer complete
 
 // Configuration constants
 const CLOCK_SYNC_VALIDITY_DURATION_SECS: u64 = 30;
@@ -33,6 +37,12 @@ const TIME_SYNC_REQUEST_TIMEOUT_SECS: u64 = 10;
 const SOCKET_READ_TIMEOUT_MS: u64 = 100;
 const THREAD_SLEEP_MS: u64 = 10;
 const JITTER_EMA_ALPHA: f64 = 0.2; // Exponential moving average alpha for jitter calculation
+
+// File transfer constants
+const FILE_TRANSFER_CHUNK_SIZE: usize = 1400; // Safe UDP payload size
+const FILE_TRANSFER_MAX_RETRIES: usize = 10;
+const FILE_TRANSFER_ACK_TIMEOUT_MS: u64 = 500;
+const FILE_TRANSFER_COMPLETE_RETRIES: usize = 3;
 
 // Helper function to get latency bucket key efficiently
 fn get_latency_bucket_key(latency_ms: f64) -> &'static str {
@@ -906,6 +916,219 @@ fn send_time_sync_response(socket: &UdpSocket, t1: u64, remote_addr: &SocketAddr
     Ok(())
 }
 
+// File transfer functionality
+fn send_file_via_udp(socket: &UdpSocket, file_path: &str, remote_addr: &SocketAddr) -> std::io::Result<()> {
+    println!("Starting file transfer: {}", file_path);
+    
+    // Read the file
+    let file_data = match fs::read(file_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read file {}: {}", file_path, e);
+            return Err(e);
+        }
+    };
+    
+    if file_data.is_empty() {
+        println!("Warning: File {} is empty, skipping transfer", file_path);
+        return Ok(());
+    }
+    
+    // Extract filename from path
+    let filename = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("results.txt")
+        .to_string();
+    
+    // Send file transfer start packet
+    let mut start_packet = Vec::new();
+    start_packet.push(PACKET_TYPE_FILE_TRANSFER_START);
+    start_packet.extend_from_slice(&(file_data.len() as u32).to_be_bytes()); // File size
+    start_packet.extend_from_slice(&(filename.len() as u16).to_be_bytes()); // Filename length
+    start_packet.extend_from_slice(filename.as_bytes()); // Filename
+    
+    // Wait for acknowledgment of start packet
+    let mut start_acknowledged = false;
+    for _ in 0..FILE_TRANSFER_MAX_RETRIES {
+        socket.send_to(&start_packet, remote_addr)?;
+        
+        // Wait for ACK
+        let mut buf = [0; 128];
+        socket.set_read_timeout(Some(Duration::from_millis(FILE_TRANSFER_ACK_TIMEOUT_MS)))?;
+        
+        match socket.recv_from(&mut buf) {
+            Ok((size, _)) if size >= 2 => {
+                if buf[0] == PACKET_TYPE_FILE_TRANSFER_ACK && buf[1] == 0xFF {
+                    // Start packet acknowledged
+                    start_acknowledged = true;
+                    break;
+                }
+            },
+            _ => {}
+        }
+    }
+    
+    if !start_acknowledged {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "Failed to get acknowledgment for file transfer start"));
+    }
+    
+    println!("File transfer start acknowledged");
+    
+    // Send file data in chunks
+    let total_chunks = (file_data.len() + FILE_TRANSFER_CHUNK_SIZE - 1) / FILE_TRANSFER_CHUNK_SIZE;
+    let mut chunks_acknowledged = vec![false; total_chunks];
+    let mut all_chunks_sent = false;
+    
+    for attempt in 0..FILE_TRANSFER_MAX_RETRIES {
+        // Send all unacknowledged chunks
+        for (chunk_index, &acknowledged) in chunks_acknowledged.iter().enumerate() {
+            if !acknowledged {
+                let start_offset = chunk_index * FILE_TRANSFER_CHUNK_SIZE;
+                let end_offset = std::cmp::min(start_offset + FILE_TRANSFER_CHUNK_SIZE, file_data.len());
+                let chunk_data = &file_data[start_offset..end_offset];
+                
+                // Create chunk packet: [type][chunk_index][chunk_data]
+                let mut chunk_packet = Vec::new();
+                chunk_packet.push(PACKET_TYPE_FILE_TRANSFER_CHUNK);
+                chunk_packet.extend_from_slice(&(chunk_index as u32).to_be_bytes());
+                chunk_packet.extend_from_slice(chunk_data);
+                
+                socket.send_to(&chunk_packet, remote_addr)?;
+            }
+        }
+        
+        // Wait for acknowledgments
+        let ack_start_time = Instant::now();
+        while ack_start_time.elapsed() < Duration::from_millis(FILE_TRANSFER_ACK_TIMEOUT_MS * 2) {
+            let mut buf = [0; 128];
+            match socket.recv_from(&mut buf) {
+                Ok((size, _)) if size >= 5 => {
+                    if buf[0] == PACKET_TYPE_FILE_TRANSFER_ACK {
+                        let mut chunk_index_bytes = [0u8; 4];
+                        chunk_index_bytes.copy_from_slice(&buf[1..5]);
+                        let chunk_index = u32::from_be_bytes(chunk_index_bytes) as usize;
+                        
+                        if chunk_index < chunks_acknowledged.len() {
+                            chunks_acknowledged[chunk_index] = true;
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+        
+        // Check if all chunks are acknowledged
+        if chunks_acknowledged.iter().all(|&acked| acked) {
+            all_chunks_sent = true;
+            break;
+        }
+        
+        println!("File transfer attempt {}/{}: {}/{} chunks acknowledged", 
+                 attempt + 1, FILE_TRANSFER_MAX_RETRIES,
+                 chunks_acknowledged.iter().filter(|&&acked| acked).count(),
+                 total_chunks);
+    }
+    
+    if !all_chunks_sent {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "Failed to transfer all file chunks"));
+    }
+    
+    // Send completion packet
+    let mut complete_packet = Vec::new();
+    complete_packet.push(PACKET_TYPE_FILE_TRANSFER_COMPLETE);
+    
+    for _ in 0..FILE_TRANSFER_COMPLETE_RETRIES {
+        socket.send_to(&complete_packet, remote_addr)?;
+        thread::sleep(Duration::from_millis(100));
+    }
+    
+    println!("File transfer completed successfully: {} ({} bytes, {} chunks)", 
+             filename, file_data.len(), total_chunks);
+    Ok(())
+}
+
+// Structure to track incoming file transfer
+struct FileTransferState {
+    filename: String,
+    file_size: usize,
+    chunks: HashMap<usize, Vec<u8>>,
+    total_chunks: usize,
+}
+
+impl FileTransferState {
+    fn new(filename: String, file_size: usize) -> Self {
+        let total_chunks = (file_size + FILE_TRANSFER_CHUNK_SIZE - 1) / FILE_TRANSFER_CHUNK_SIZE;
+        FileTransferState {
+            filename,
+            file_size,
+            chunks: HashMap::new(),
+            total_chunks,
+        }
+    }
+    
+    fn is_complete(&self) -> bool {
+        self.chunks.len() == self.total_chunks
+    }
+    
+    fn save_to_file(&self) -> std::io::Result<()> {
+        let mut file_data = Vec::with_capacity(self.file_size);
+        
+        // Reassemble chunks in order
+        for chunk_index in 0..self.total_chunks {
+            if let Some(chunk_data) = self.chunks.get(&chunk_index) {
+                file_data.extend_from_slice(chunk_data);
+            } else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, 
+                    format!("Missing chunk {}", chunk_index)));
+            }
+        }
+        
+        // Add prefix to avoid overwriting existing files
+        let safe_filename = format!("received_{}", self.filename);
+        
+        // Create directory if it doesn't exist
+        if let Some(parent) = std::path::Path::new(&safe_filename).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        fs::write(&safe_filename, file_data)?;
+        println!("File received and saved as: {} ({} bytes)", safe_filename, self.file_size);
+        Ok(())
+    }
+}
+
+// Function to send results files before termination
+fn send_results_files(socket: &UdpSocket, remote_addr: &SocketAddr, json_file: Option<&str>, csv_file: Option<&str>) {
+    println!("=== SENDING RESULTS FILES TO REMOTE ===");
+    
+    // Send JSON file if it exists
+    if let Some(json_path) = json_file {
+        if std::path::Path::new(json_path).exists() {
+            match send_file_via_udp(socket, json_path, remote_addr) {
+                Ok(_) => println!("Successfully sent JSON results file"),
+                Err(e) => eprintln!("Failed to send JSON results file: {}", e),
+            }
+        } else {
+            println!("JSON file does not exist: {}", json_path);
+        }
+    }
+    
+    // Send CSV file if it exists
+    if let Some(csv_path) = csv_file {
+        if std::path::Path::new(csv_path).exists() {
+            match send_file_via_udp(socket, csv_path, remote_addr) {
+                Ok(_) => println!("Successfully sent CSV results file"),
+                Err(e) => eprintln!("Failed to send CSV results file: {}", e),
+            }
+        } else {
+            println!("CSV file does not exist: {}", csv_path);
+        }
+    }
+    
+    println!("=== RESULTS FILE TRANSFER COMPLETED ===");
+}
+
 fn main() -> std::io::Result<()> {
     let matches = App::new("UDP Monitor")
         .version("1.5")
@@ -1055,6 +1278,7 @@ fn main() -> std::io::Result<()> {
     let socket = Arc::clone(&Arc::new(socket));
     let latency_stats = Arc::new(Mutex::new(LatencyStats::new()));
     let clock_sync = Arc::new(Mutex::new(ClockSync::new()));
+    let file_transfer_state = Arc::new(Mutex::new(Option::<FileTransferState>::None));
     
     // Map to track pending time sync requests
     let time_sync_requests = Arc::new(Mutex::new(std::collections::HashMap::<u64, Instant>::new()));
@@ -1079,19 +1303,7 @@ fn main() -> std::io::Result<()> {
         println!("\nReceived Ctrl+C signal, initiating graceful shutdown...");
         r.store(false, Ordering::SeqCst);
         
-        // Send termination packet to the remote side
-        let _ = send_terminate_packet(&terminate_socket, &terminate_remote);
-        
-        // Give threads more time to notice the termination signal and clean up
-        let shutdown_timeout = Duration::from_millis(5000); // Increased from 2000ms to 5000ms
-        let start_time = Instant::now();
-        
-        // Wait for threads with timeout
-        while start_time.elapsed() < shutdown_timeout {
-            thread::sleep(Duration::from_millis(100));
-        }
-        
-        // Save final statistics with all latency data included
+        // Save final statistics first
         println!("Saving final statistics from Ctrl+C handler...");
         {
             match final_stats.lock() {
@@ -1119,6 +1331,21 @@ fn main() -> std::io::Result<()> {
                     eprintln!("Warning: Could not acquire stats lock for final save in Ctrl+C handler: {e}");
                 }
             }
+        }
+        
+        // Send results files to remote before terminating
+        send_results_files(&terminate_socket, &terminate_remote, json_path.as_deref(), csv_path.as_deref());
+        
+        // Send termination packet to the remote side
+        let _ = send_terminate_packet(&terminate_socket, &terminate_remote);
+        
+        // Give threads more time to notice the termination signal and clean up
+        let shutdown_timeout = Duration::from_millis(5000); // Increased from 2000ms to 5000ms
+        let start_time = Instant::now();
+        
+        // Wait for threads with timeout
+        while start_time.elapsed() < shutdown_timeout {
+            thread::sleep(Duration::from_millis(100));
         }
         
        // Don't call exit here - let main thread handle cleanup
@@ -1357,7 +1584,7 @@ fn main() -> std::io::Result<()> {
             
             // Check if we've reached the packet count limit
             if count > 0 && sent_count >= count {
-                println!("\nPacket count limit reached, saving final statistics and notifying remote side...");
+                println!("\nPacket count limit reached, saving final statistics and sending results to remote...");
                 
                 // Save final statistics before terminating
                 {
@@ -1383,6 +1610,9 @@ fn main() -> std::io::Result<()> {
                     }
                 }
                 
+                // Send results files to remote
+                send_results_files(&sender_socket, &sender_remote, sender_json_path.as_deref(), sender_csv_path.as_deref());
+                
                 sender_running.store(false, Ordering::SeqCst);
                 let _ = send_terminate_packet(&sender_socket, &sender_remote);
                 break;
@@ -1406,6 +1636,7 @@ fn main() -> std::io::Result<()> {
     let receiver_latency = Arc::clone(&latency_stats);
     let receiver_clock_sync = Arc::clone(&clock_sync);
     let receiver_time_reqs = Arc::clone(&time_sync_requests);
+    let receiver_file_state = Arc::clone(&file_transfer_state);
     let json_path_recv = json_file.clone();
     let csv_path_recv = csv_file.clone();
     
@@ -1543,9 +1774,8 @@ fn main() -> std::io::Result<()> {
                             },
                             
                             PACKET_TYPE_TERMINATE => {
-                                // Received terminate packet, initiate clean shutdown
+                                // Received terminate packet, send our results and initiate clean shutdown
                                 println!("\nReceived termination signal from remote side...");
-                                receiver_running.store(false, Ordering::SeqCst);
                                 
                                 // Save stats before exit
                                 {
@@ -1571,8 +1801,102 @@ fn main() -> std::io::Result<()> {
                                     }
                                 }
                                 
+                                // Send our results files to remote before shutting down
+                                send_results_files(&receiver_socket, &src, json_path_recv.as_deref(), csv_path_recv.as_deref());
+                                
+                                receiver_running.store(false, Ordering::SeqCst);
                                 //println!("Receiver thread shutting down gracefully...");
                                 return; // Exit receiver thread gracefully
+                            },
+                            
+                            PACKET_TYPE_FILE_TRANSFER_START if size >= 7 => {
+                                // Extract file size and filename
+                                let mut file_size_bytes = [0u8; 4];
+                                file_size_bytes.copy_from_slice(&buf[1..5]);
+                                let file_size = u32::from_be_bytes(file_size_bytes) as usize;
+                                
+                                let mut filename_len_bytes = [0u8; 2];
+                                filename_len_bytes.copy_from_slice(&buf[5..7]);
+                                let filename_len = u16::from_be_bytes(filename_len_bytes) as usize;
+                                
+                                if size >= 7 + filename_len {
+                                    let filename = String::from_utf8_lossy(&buf[7..7 + filename_len]).to_string();
+                                    
+                                    println!("Starting file transfer: {} ({} bytes)", filename, file_size);
+                                    
+                                    // Initialize file transfer state
+                                    let new_state = FileTransferState::new(filename, file_size);
+                                    match receiver_file_state.lock() {
+                                        Ok(mut state) => {
+                                            *state = Some(new_state);
+                                        },
+                                        Err(_) => {
+                                            eprintln!("Failed to initialize file transfer state");
+                                            continue;
+                                        }
+                                    }
+                                    
+                                    // Send acknowledgment for start
+                                    let mut ack_packet = Vec::new();
+                                    ack_packet.push(PACKET_TYPE_FILE_TRANSFER_ACK);
+                                    ack_packet.push(0xFF); // Special marker for start ack
+                                    
+                                    if let Err(e) = receiver_socket.send_to(&ack_packet, &src) {
+                                        eprintln!("Failed to send file transfer start ACK: {}", e);
+                                    }
+                                }
+                            },
+                            
+                            PACKET_TYPE_FILE_TRANSFER_CHUNK if size >= 5 => {
+                                // Extract chunk index
+                                let mut chunk_index_bytes = [0u8; 4];
+                                chunk_index_bytes.copy_from_slice(&buf[1..5]);
+                                let chunk_index = u32::from_be_bytes(chunk_index_bytes) as usize;
+                                
+                                // Store chunk data
+                                let chunk_data = buf[5..size].to_vec();
+                                
+                                match receiver_file_state.lock() {
+                                    Ok(mut state) => {
+                                        if let Some(ref mut transfer_state) = *state {
+                                            transfer_state.chunks.insert(chunk_index, chunk_data);
+                                            
+                                            // Send acknowledgment for this chunk
+                                            let mut ack_packet = Vec::new();
+                                            ack_packet.push(PACKET_TYPE_FILE_TRANSFER_ACK);
+                                            ack_packet.extend_from_slice(&(chunk_index as u32).to_be_bytes());
+                                            
+                                            if let Err(e) = receiver_socket.send_to(&ack_packet, &src) {
+                                                eprintln!("Failed to send chunk ACK: {}", e);
+                                            }
+                                        }
+                                    },
+                                    Err(_) => {
+                                        eprintln!("Failed to access file transfer state for chunk");
+                                    }
+                                }
+                            },
+                            
+                            PACKET_TYPE_FILE_TRANSFER_COMPLETE => {
+                                // File transfer completed, save the file
+                                match receiver_file_state.lock() {
+                                    Ok(mut state) => {
+                                        if let Some(ref transfer_state) = *state {
+                                            if transfer_state.is_complete() {
+                                                if let Err(e) = transfer_state.save_to_file() {
+                                                    eprintln!("Failed to save received file: {}", e);
+                                                }
+                                            } else {
+                                                println!("File transfer incomplete: {}/{} chunks received", 
+                                                        transfer_state.chunks.len(), transfer_state.total_chunks);
+                                            }
+                                        }
+                                        *state = None; // Clear transfer state
+                                    },
+                                    Err(_) => {
+                                        eprintln!("Failed to access file transfer state for completion");
+                                    }
+                                }
                             },
                             
                             // Sync packets are handled in the sync thread

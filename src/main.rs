@@ -924,7 +924,11 @@ fn main() -> std::io::Result<()> {
             .value_name("REMOTE_ADDR")
             .help("Remote address to send packets to")
             .takes_value(true)
-            .required(true))
+            .required_unless("receive_only"))
+        .arg(Arg::with_name("receive_only")
+            .long("receive-only")
+            .help("Only receive packets without sending (remote address not required)")
+            .takes_value(false))
         .arg(Arg::with_name("interval")
             .short("i")
             .long("interval")
@@ -980,7 +984,8 @@ fn main() -> std::io::Result<()> {
         .get_matches();
 
     let local_addr = matches.value_of("local").unwrap();
-    let remote_addr = matches.value_of("remote").unwrap();
+    let receive_only = matches.is_present("receive_only");
+    let remote_addr = matches.value_of("remote");
     let interval = matches.value_of("interval").unwrap().parse::<u64>()
         .expect("Interval must be a valid number");
     let count = matches.value_of("count").unwrap().parse::<u64>()
@@ -1013,10 +1018,15 @@ fn main() -> std::io::Result<()> {
     });
 
     // Initialize display
+    let mode_str = if receive_only { "RECEIVE ONLY" } else { "SEND & RECEIVE" };
+    let remote_str = remote_addr.unwrap_or("N/A (receive-only mode)");
     println!("UDP Monitor v1.5 - Timestamp-based Latency Measurement");
-    println!("Local: {local_addr}, Remote: {remote_addr}, Interval: {interval}ms");
-    println!("Clock synchronization every {clock_sync_interval} seconds");
-    println!("Data export every {export_interval} seconds");
+    println!("Mode: {mode_str}");
+    println!("Local: {local_addr}, Remote: {remote_str}, Interval: {interval}ms");
+    if !receive_only {
+        println!("Clock synchronization every {clock_sync_interval} seconds");
+        println!("Data export every {export_interval} seconds");
+    }
     println!("Press Ctrl+C to exit and save statistics");
     println!();
     
@@ -1047,7 +1057,11 @@ fn main() -> std::io::Result<()> {
         }
     }
     
-    let remote_addr = SocketAddr::from_str(remote_addr).expect("Invalid remote address");
+    let remote_addr_parsed = if let Some(addr_str) = remote_addr {
+        Some(SocketAddr::from_str(addr_str).expect("Invalid remote address"))
+    } else {
+        None
+    };
     
     // Create shared data structures
     let stats = Arc::new(Mutex::new(PacketStats::new()));
@@ -1067,7 +1081,7 @@ fn main() -> std::io::Result<()> {
     
     // Setup clean termination signal
     let terminate_socket = Arc::clone(&socket);
-    let terminate_remote = remote_addr;
+    let terminate_remote = remote_addr_parsed;
     let r = running.clone();
     let final_stats = stats.clone();
     let final_latency = latency_stats.clone();
@@ -1079,8 +1093,10 @@ fn main() -> std::io::Result<()> {
         println!("\nReceived Ctrl+C signal, initiating graceful shutdown...");
         r.store(false, Ordering::SeqCst);
         
-        // Send termination packet to the remote side
-        let _ = send_terminate_packet(&terminate_socket, &terminate_remote);
+        // Send termination packet to the remote side (if we have a remote address)
+        if let Some(remote) = terminate_remote {
+            let _ = send_terminate_packet(&terminate_socket, &remote);
+        }
         
         // Give threads more time to notice the termination signal and clean up
         let shutdown_timeout = Duration::from_millis(5000); // Increased from 2000ms to 5000ms
@@ -1124,12 +1140,12 @@ fn main() -> std::io::Result<()> {
        // Don't call exit here - let main thread handle cleanup
     }).expect("Error setting Ctrl+C handler");
 
-    // Synchronization thread if enabled
-    if enable_sync {
+    // Synchronization thread if enabled and not in receive-only mode
+    if enable_sync && !receive_only && remote_addr_parsed.is_some() {
         let sync_socket = Arc::clone(&socket);
         let sync_running = Arc::clone(&running);
         let sync_status = Arc::clone(&synchronized);
-        let sync_remote = remote_addr;
+        let sync_remote = remote_addr_parsed.unwrap();
         
         let sync_handle = thread::spawn(move || {
             let start_time = Instant::now();
@@ -1221,14 +1237,15 @@ fn main() -> std::io::Result<()> {
     print!("\x1B[2J\x1B[H");
     io::stdout().flush().unwrap();
 
-    // Clock synchronization thread
-    let clock_sync_socket = Arc::clone(&socket);
-    let clock_sync_running = Arc::clone(&running);
-    let clock_sync_remote = remote_addr;
-    let clock_sync_data = Arc::clone(&clock_sync);
-    let time_sync_reqs = Arc::clone(&time_sync_requests);
-    
-    let clock_sync_handle = thread::spawn(move || {
+    // Clock synchronization thread (only if not in receive-only mode)
+    let clock_sync_handle = if !receive_only && remote_addr_parsed.is_some() {
+        let clock_sync_socket = Arc::clone(&socket);
+        let clock_sync_running = Arc::clone(&running);
+        let clock_sync_remote = remote_addr_parsed.unwrap();
+        let clock_sync_data = Arc::clone(&clock_sync);
+        let time_sync_reqs = Arc::clone(&time_sync_requests);
+        
+        Some(thread::spawn(move || {
         // Start right away with first sync
         let mut next_sync = Instant::now();
         
@@ -1282,21 +1299,25 @@ fn main() -> std::io::Result<()> {
             }
         }
         
-    });
+        }))
+    } else {
+        None
+    };
 
-    // Sender thread
-    let sender_socket = Arc::clone(&socket);
-    let sender_stats = Arc::clone(&stats);
-    let sender_activity = Arc::clone(&activity);
-    let sender_running = Arc::clone(&running);
-    let sender_sync = Arc::clone(&synchronized);
-    let sender_remote = remote_addr;
-    let sender_latency = Arc::clone(&latency_stats);
-    let sender_clock_sync = Arc::clone(&clock_sync);
-    let sender_json_path = json_file.clone();
-    let sender_csv_path = csv_file.clone();
-    
-    let sender_handle = thread::spawn(move || {
+    // Sender thread (only if not in receive-only mode)
+    let sender_handle = if !receive_only && remote_addr_parsed.is_some() {
+        let sender_socket = Arc::clone(&socket);
+        let sender_stats = Arc::clone(&stats);
+        let sender_activity = Arc::clone(&activity);
+        let sender_running = Arc::clone(&running);
+        let sender_sync = Arc::clone(&synchronized);
+        let sender_remote = remote_addr_parsed.unwrap();
+        let sender_latency = Arc::clone(&latency_stats);
+        let sender_clock_sync = Arc::clone(&clock_sync);
+        let sender_json_path = json_file.clone();
+        let sender_csv_path = csv_file.clone();
+        
+        Some(thread::spawn(move || {
         let mut seq_num: u64 = 0;
         let mut sent_count = 0;
 
@@ -1396,7 +1417,10 @@ fn main() -> std::io::Result<()> {
             thread::sleep(Duration::from_millis(interval));
         }
         
-    });
+        }))
+    } else {
+        None
+    };
 
     // Receiver thread
     let receiver_socket = Arc::clone(&socket);
@@ -1794,13 +1818,17 @@ fn main() -> std::io::Result<()> {
     
     let mut all_joined = true;
     
-    // Join sender thread with error handling
-    match sender_handle.join() {
-        Ok(_) => println!("Sender thread completed successfully"),
-        Err(e) => {
-            eprintln!("Sender thread panicked: {e:?}");
-            all_joined = false;
+    // Join sender thread with error handling (if it exists)
+    if let Some(handle) = sender_handle {
+        match handle.join() {
+            Ok(_) => println!("Sender thread completed successfully"),
+            Err(e) => {
+                eprintln!("Sender thread panicked: {e:?}");
+                all_joined = false;
+            }
         }
+    } else {
+        println!("Sender thread was not started (receive-only mode)");
     }
     
     // Join receiver thread with error handling
@@ -1821,13 +1849,17 @@ fn main() -> std::io::Result<()> {
         }
     }
     
-    // Join clock sync thread with error handling
-    match clock_sync_handle.join() {
-        Ok(_) => println!("Clock sync thread completed successfully"),
-        Err(e) => {
-            eprintln!("Clock sync thread panicked: {e:?}");
-            all_joined = false;
+    // Join clock sync thread with error handling (if it exists)
+    if let Some(handle) = clock_sync_handle {
+        match handle.join() {
+            Ok(_) => println!("Clock sync thread completed successfully"),
+            Err(e) => {
+                eprintln!("Clock sync thread panicked: {e:?}");
+                all_joined = false;
+            }
         }
+    } else {
+        println!("Clock sync thread was not started (receive-only mode)");
     }
     
     if all_joined {

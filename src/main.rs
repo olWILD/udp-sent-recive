@@ -1432,9 +1432,15 @@ fn main() -> std::io::Result<()> {
     let receiver_time_reqs = Arc::clone(&time_sync_requests);
     let json_path_recv = json_file.clone();
     let csv_path_recv = csv_file.clone();
+    let receiver_receive_only = receive_only;
+    let receiver_clock_sync_interval = clock_sync_interval;
     
     let receiver_handle = thread::spawn(move || {
         let mut buf = [0; 2048];
+        
+        // Track source addresses for time sync in receive-only mode
+        let mut known_sources: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
+        let mut last_time_sync_attempt = std::collections::HashMap::<SocketAddr, Instant>::new();
 
         // Set socket to non-blocking mode
         receiver_socket.set_nonblocking(true).expect("Failed to set non-blocking mode");
@@ -1509,6 +1515,70 @@ fn main() -> std::io::Result<()> {
                                     },
                                     Err(_) => {
                                         // Continue processing other packets if stats lock fails
+                                    }
+                                }
+                                
+                                // In receive-only mode, initiate time sync with sources that send us data
+                                // This is needed to establish clock synchronization for latency calculation
+                                if receiver_receive_only {
+                                    // Track this source and potentially initiate time sync
+                                    if !known_sources.contains(&src) {
+                                        known_sources.insert(src);
+                                        last_time_sync_attempt.insert(src, Instant::now());
+                                        
+                                        // Send initial time sync request to this new source
+                                        if let Ok(t1) = send_time_sync_packet(&receiver_socket, &src) {
+                                            // Store the request in pending requests
+                                            match receiver_time_reqs.lock() {
+                                                Ok(mut requests) => {
+                                                    requests.insert(t1, Instant::now());
+                                                },
+                                                Err(_) => {
+                                                    // Continue without storing request if lock fails
+                                                }
+                                            }
+                                            
+                                            // Update sync counter
+                                            match receiver_clock_sync.lock() {
+                                                Ok(mut sync_data) => {
+                                                    sync_data.sync_packets_sent += 1;
+                                                },
+                                                Err(_) => {
+                                                    // Continue without updating counter if lock fails
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // For known sources, send periodic time sync requests
+                                        let should_sync = last_time_sync_attempt.get(&src)
+                                            .map(|last_time| last_time.elapsed() >= Duration::from_secs(receiver_clock_sync_interval))
+                                            .unwrap_or(true);
+                                            
+                                        if should_sync {
+                                            last_time_sync_attempt.insert(src, Instant::now());
+                                            
+                                            if let Ok(t1) = send_time_sync_packet(&receiver_socket, &src) {
+                                                // Store the request in pending requests
+                                                match receiver_time_reqs.lock() {
+                                                    Ok(mut requests) => {
+                                                        requests.insert(t1, Instant::now());
+                                                    },
+                                                    Err(_) => {
+                                                        // Continue without storing request if lock fails
+                                                    }
+                                                }
+                                                
+                                                // Update sync counter
+                                                match receiver_clock_sync.lock() {
+                                                    Ok(mut sync_data) => {
+                                                        sync_data.sync_packets_sent += 1;
+                                                    },
+                                                    Err(_) => {
+                                                        // Continue without updating counter if lock fails
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             },

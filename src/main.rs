@@ -922,7 +922,7 @@ fn main() -> std::io::Result<()> {
             .short("r")
             .long("remote")
             .value_name("REMOTE_ADDR")
-            .help("Remote address to send packets to")
+            .help("Remote address to send packets to (required for sync in receive-only mode)")
             .takes_value(true)
             .required_unless("receive_only"))
         .arg(Arg::with_name("receive_only")
@@ -986,13 +986,19 @@ fn main() -> std::io::Result<()> {
     let local_addr = matches.value_of("local").unwrap();
     let receive_only = matches.is_present("receive_only");
     let remote_addr = matches.value_of("remote");
+    let enable_sync = matches.is_present("sync");
+    
+    // Validate that --remote is provided when --sync is used with --receive-only
+    if receive_only && enable_sync && remote_addr.is_none() {
+        eprintln!("Error: --remote parameter is required when using --sync with --receive-only mode");
+        std::process::exit(1);
+    }
     let interval = matches.value_of("interval").unwrap().parse::<u64>()
         .expect("Interval must be a valid number");
     let count = matches.value_of("count").unwrap().parse::<u64>()
         .expect("Count must be a valid number");
     let stats_interval = matches.value_of("stats_interval").unwrap().parse::<u64>()
         .expect("Stats interval must be a valid number");
-    let enable_sync = matches.is_present("sync");
     let sync_timeout = matches.value_of("sync_timeout").unwrap().parse::<u64>()
         .expect("Sync timeout must be a valid number");
     let clock_sync_interval = matches.value_of("clock_sync_interval").unwrap().parse::<u64>()
@@ -1019,11 +1025,11 @@ fn main() -> std::io::Result<()> {
 
     // Initialize display
     let mode_str = if receive_only { "RECEIVE ONLY" } else { "SEND & RECEIVE" };
-    let remote_str = remote_addr.unwrap_or("N/A (receive-only mode)");
+    let remote_str = remote_addr.unwrap_or("N/A");
     println!("UDP Monitor v1.5 - Timestamp-based Latency Measurement");
     println!("Mode: {mode_str}");
     println!("Local: {local_addr}, Remote: {remote_str}, Interval: {interval}ms");
-    if !receive_only {
+    if remote_addr.is_some() {
         println!("Clock synchronization every {clock_sync_interval} seconds");
         println!("Data export every {export_interval} seconds");
     }
@@ -1140,8 +1146,8 @@ fn main() -> std::io::Result<()> {
        // Don't call exit here - let main thread handle cleanup
     }).expect("Error setting Ctrl+C handler");
 
-    // Synchronization thread if enabled and not in receive-only mode
-    if enable_sync && !receive_only && remote_addr_parsed.is_some() {
+    // Synchronization thread if enabled and we have a remote address
+    if enable_sync && remote_addr_parsed.is_some() {
         let sync_socket = Arc::clone(&socket);
         let sync_running = Arc::clone(&running);
         let sync_status = Arc::clone(&synchronized);
@@ -1237,8 +1243,8 @@ fn main() -> std::io::Result<()> {
     print!("\x1B[2J\x1B[H");
     io::stdout().flush().unwrap();
 
-    // Clock synchronization thread (only if not in receive-only mode)
-    let clock_sync_handle = if !receive_only && remote_addr_parsed.is_some() {
+    // Clock synchronization thread (if we have a remote address for sync)
+    let clock_sync_handle = if remote_addr_parsed.is_some() {
         let clock_sync_socket = Arc::clone(&socket);
         let clock_sync_running = Arc::clone(&running);
         let clock_sync_remote = remote_addr_parsed.unwrap();
@@ -1929,7 +1935,7 @@ fn main() -> std::io::Result<()> {
             }
         }
     } else {
-        println!("Clock sync thread was not started (receive-only mode)");
+        println!("Clock sync thread was not started (no remote address provided)");
     }
     
     if all_joined {

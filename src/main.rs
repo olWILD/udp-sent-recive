@@ -20,6 +20,7 @@ const PACKET_TYPE_TIME_SYNC: u8 = 5;          // Packet for time synchronization
 const PACKET_TYPE_TIME_SYNC_RESP: u8 = 6;     // Response to time sync packet
 
 // Configuration constants
+const PACKET_DATA_SIZE: usize = 1000; // Size of data payload in bytes
 const CLOCK_SYNC_VALIDITY_DURATION_SECS: u64 = 30;
 const CLOCK_SYNC_MIN_SAMPLES: u64 = 5;
 const CLOCK_SYNC_RELIABLE_STDDEV: f64 = 50.0;
@@ -37,20 +38,20 @@ const JITTER_EMA_ALPHA: f64 = 0.2; // Exponential moving average alpha for jitte
 // Helper function to get latency bucket key efficiently
 fn get_latency_bucket_key(latency_ms: f64) -> &'static str {
     match latency_ms as u64 {
-        0..=24 => "0-25ms",
-        25..=49 => "25-50ms",
-        50..=74 => "50-75ms",
-        75..=99 => "75-100ms",
-        100..=124 => "100-125ms",
-        125..=149 => "125-150ms",
-        150..=174 => "150-175ms",
-        175..=199 => "175-200ms",
-        200..=249 => "200-250ms",
-        250..=299 => "250-300ms",
-        300..=349 => "300-350ms",
-        350..=399 => "350-400ms",
-        400..=449 => "400-450ms",
-        450..=499 => "450-500ms",
+        0..=24 => "0-24ms",
+        25..=49 => "25-49ms",
+        50..=74 => "50-74ms",
+        75..=99 => "75-99ms",
+        100..=124 => "100-124ms",
+        125..=149 => "125-149ms",
+        150..=174 => "150-174ms",
+        175..=199 => "175-199ms",
+        200..=249 => "200-249ms",
+        250..=299 => "250-299ms",
+        300..=349 => "300-349ms",
+        350..=399 => "350-399ms",
+        400..=449 => "400-449ms",
+        450..=499 => "450-499ms",
         500..=999 => "500-999ms",
         _ => ">1000ms",
     }
@@ -199,9 +200,8 @@ impl LatencyStats {
     fn new() -> Self {
         // Initialize latency buckets
         let buckets = [
-            "0-25ms", "25-50ms", "50-75ms", "75-100ms", "100-125ms", "125-150ms", "150-175ms", "175-200ms",
-            "200-250ms", "250-300ms", "300-350ms", "350-400ms", "400-450ms", "450-500ms",
-            "500-999ms", ">1000ms",
+            "0-24ms", "25-49ms", "50-74ms", "75-99ms", "100-124ms", "125-149ms", "150-174ms", "175-199ms",
+            "200-249ms", "250-299ms", "300-349ms", "350-399ms", "400-449ms", "450-499ms", "500-999ms", ">1000ms",
         ]
         .iter()
         .map(|s| (s.to_string(), 0))
@@ -419,20 +419,20 @@ struct CsvExportStats {
     jitter_ms: Option<f64>,
     
     // Latency distribution buckets as separate fields
-    bucket_0_25ms: u64,
-    bucket_25_50ms: u64,
-    bucket_50_75ms: u64,
-    bucket_75_100ms: u64,
-    bucket_100_125ms: u64,
-    bucket_125_150ms: u64,
-    bucket_150_175ms: u64,
-    bucket_175_200ms: u64,
-    bucket_200_250ms: u64,
-    bucket_250_300ms: u64,
-    bucket_300_350ms: u64,
-    bucket_350_400ms: u64,
-    bucket_400_450ms: u64,
-    bucket_450_500ms: u64,
+    bucket_0_24ms: u64,
+    bucket_25_49ms: u64,
+    bucket_50_74ms: u64,
+    bucket_75_99ms: u64,
+    bucket_100_124ms: u64,
+    bucket_125_149ms: u64,
+    bucket_150_174ms: u64,
+    bucket_175_199ms: u64,
+    bucket_200_249ms: u64,
+    bucket_250_299ms: u64,
+    bucket_300_349ms: u64,
+    bucket_350_399ms: u64,
+    bucket_400_449ms: u64,
+    bucket_450_499ms: u64,
     bucket_500_999ms: u64,
     bucket_gt_1000ms: u64,
 }
@@ -488,9 +488,8 @@ impl PacketStats {
     fn new() -> Self {
         // Initialize latency buckets (standardized to match LatencyStats)
         let buckets = [
-            "0-25ms", "25-50ms", "50-75ms", "75-100ms", "100-125ms", "125-150ms", "150-175ms", "175-200ms",
-            "200-250ms", "250-300ms", "300-350ms", "350-400ms", "400-450ms", "450-500ms",
-            "500-999ms", ">1000ms",
+            "0-24ms", "25-49ms", "50-74ms", "75-99ms", "100-124ms", "125-149ms", "150-174ms", "175-199ms",
+            "200-249ms", "250-299ms", "300-349ms", "350-399ms", "400-449ms", "450-499ms", "500-999ms", ">1000ms",
         ]
         .iter()
         .map(|s| (s.to_string(), 0))
@@ -603,20 +602,20 @@ impl PacketStats {
             p95_latency_ms: self.p95_latency_ms,
             p99_latency_ms: self.p99_latency_ms,
             jitter_ms: self.jitter_ms,
-            bucket_0_25ms: *self.latency_buckets.get("0-25ms").unwrap_or(&0),
-            bucket_25_50ms: *self.latency_buckets.get("25-50ms").unwrap_or(&0),
-            bucket_50_75ms: *self.latency_buckets.get("50-75ms").unwrap_or(&0),
-            bucket_75_100ms: *self.latency_buckets.get("75-100ms").unwrap_or(&0),
-            bucket_100_125ms: *self.latency_buckets.get("100-125ms").unwrap_or(&0),
-            bucket_125_150ms: *self.latency_buckets.get("125-150ms").unwrap_or(&0),
-            bucket_150_175ms: *self.latency_buckets.get("150-175ms").unwrap_or(&0),
-            bucket_175_200ms: *self.latency_buckets.get("175-200ms").unwrap_or(&0),
-            bucket_200_250ms: *self.latency_buckets.get("200-250ms").unwrap_or(&0),
-            bucket_250_300ms: *self.latency_buckets.get("250-300ms").unwrap_or(&0),
-            bucket_300_350ms: *self.latency_buckets.get("300-350ms").unwrap_or(&0),
-            bucket_350_400ms: *self.latency_buckets.get("350-400ms").unwrap_or(&0),
-            bucket_400_450ms: *self.latency_buckets.get("400-450ms").unwrap_or(&0),
-            bucket_450_500ms: *self.latency_buckets.get("450-500ms").unwrap_or(&0),
+            bucket_0_24ms: *self.latency_buckets.get("0-24ms").unwrap_or(&0),
+            bucket_25_49ms: *self.latency_buckets.get("25-49ms").unwrap_or(&0),
+            bucket_50_74ms: *self.latency_buckets.get("50-74ms").unwrap_or(&0),
+            bucket_75_99ms: *self.latency_buckets.get("75-99ms").unwrap_or(&0),
+            bucket_100_124ms: *self.latency_buckets.get("100-124ms").unwrap_or(&0),
+            bucket_125_149ms: *self.latency_buckets.get("125-149ms").unwrap_or(&0),
+            bucket_150_174ms: *self.latency_buckets.get("150-174ms").unwrap_or(&0),
+            bucket_175_199ms: *self.latency_buckets.get("175-199ms").unwrap_or(&0),
+            bucket_200_249ms: *self.latency_buckets.get("200-249ms").unwrap_or(&0),
+            bucket_250_299ms: *self.latency_buckets.get("250-299ms").unwrap_or(&0),
+            bucket_300_349ms: *self.latency_buckets.get("300-349ms").unwrap_or(&0),
+            bucket_350_399ms: *self.latency_buckets.get("350-399ms").unwrap_or(&0),
+            bucket_400_449ms: *self.latency_buckets.get("400-449ms").unwrap_or(&0),
+            bucket_450_499ms: *self.latency_buckets.get("450-499ms").unwrap_or(&0),
             bucket_500_999ms: *self.latency_buckets.get("500-999ms").unwrap_or(&0),
             bucket_gt_1000ms: *self.latency_buckets.get(">1000ms").unwrap_or(&0),
         }
@@ -968,7 +967,7 @@ fn main() -> std::io::Result<()> {
             .value_name("SECONDS")
             .help("Timeout for initial synchronization in seconds")
             .takes_value(true)
-            .default_value("30"))
+            .default_value("600"))
         .arg(Arg::with_name("clock_sync_interval")
             .long("clock-sync-interval")
             .value_name("SECONDS")
@@ -981,12 +980,22 @@ fn main() -> std::io::Result<()> {
             .help("Interval for exporting statistics to files in seconds")
             .takes_value(true)
             .default_value("5"))
+        .arg(Arg::with_name("interval_latency")
+            .long("interval-latency")
+            .help("Use alternative latency measurement: (inter-arrival time) - (--interval)")
+            .takes_value(false))
+        .arg(Arg::with_name("raw_latency")
+            .long("raw-latency")
+            .value_name("CSV_FILE")
+            .help("Append raw per-packet latency samples to a CSV file: recv_time_ms,seq,latency_ms,mode")
+            .takes_value(true))
         .get_matches();
 
     let local_addr = matches.value_of("local").unwrap();
     let receive_only = matches.is_present("receive_only");
     let remote_addr = matches.value_of("remote");
     let enable_sync = matches.is_present("sync");
+    let interval_latency_mode = matches.is_present("interval_latency");
     
     // Validate that --remote is provided when --sync is used with --receive-only
     if receive_only && enable_sync && remote_addr.is_none() {
@@ -1006,6 +1015,11 @@ fn main() -> std::io::Result<()> {
     let export_interval = matches.value_of("export_interval").unwrap().parse::<u64>()
         .expect("Export interval must be a valid number");
     
+    // Raw latency CSV export path (optional)
+    let raw_latency_path: Option<String> = matches.value_of("raw_latency").map(|path| {
+        if path.ends_with(".csv") { path.to_string() } else { format!("{path}.csv") }
+    });
+
     // Auto-append file extensions if missing
     let json_file = matches.value_of("json").map(|path| {
         if path.ends_with(".json") {
@@ -1026,13 +1040,19 @@ fn main() -> std::io::Result<()> {
     // Initialize display
     let mode_str = if receive_only { "RECEIVE ONLY" } else { "SEND & RECEIVE" };
     let remote_str = remote_addr.unwrap_or("N/A");
-    println!("UDP Monitor v1.5 - Timestamp-based Latency Measurement");
+    let latency_mode_label = if interval_latency_mode || clock_sync_interval == 0 { "Arrival-interval-based Latency Measurement" } else { "Timestamp-based Latency Measurement" };
+    println!("UDP Monitor v1.5 - {}", latency_mode_label);
     println!("Mode: {mode_str}");
     println!("Local: {local_addr}, Remote: {remote_str}, Interval: {interval}ms");
     if remote_addr.is_some() {
-        println!("Clock synchronization every {clock_sync_interval} seconds");
+        if clock_sync_interval > 0 {
+            println!("Clock synchronization every {clock_sync_interval} seconds");
+        } else {
+            println!("Clock synchronization: disabled");
+        }
         println!("Data export every {export_interval} seconds");
     }
+    if let Some(ref p) = raw_latency_path { println!("Raw latency export: {p}"); }
     println!("Press Ctrl+C to exit and save statistics");
     println!();
     
@@ -1062,6 +1082,20 @@ fn main() -> std::io::Result<()> {
             println!("Created empty JSON array file: {file}");
         }
     }
+    
+    // Initialize raw latency CSV writer (append mode) if requested
+    let raw_latency_writer: Option<Arc<Mutex<File>>> = if let Some(ref file) = raw_latency_path {
+        let path = std::path::Path::new(file);
+        let existed = path.exists();
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        if !existed {
+            use std::io::Write as _;
+            writeln!(f, "recv_time_ms,seq,latency_ms,mode")?;
+            f.flush()?;
+            println!("Created raw latency CSV with headers: {file}");
+        }
+        Some(Arc::new(Mutex::new(f)))
+    } else { None };
     
     let remote_addr_parsed = if let Some(addr_str) = remote_addr {
         Some(SocketAddr::from_str(addr_str).expect("Invalid remote address"))
@@ -1244,7 +1278,7 @@ fn main() -> std::io::Result<()> {
     io::stdout().flush().unwrap();
 
     // Clock synchronization thread (if we have a remote address for sync)
-    let clock_sync_handle = if remote_addr_parsed.is_some() {
+    let clock_sync_handle = if remote_addr_parsed.is_some() && clock_sync_interval > 0 {
         let clock_sync_socket = Arc::clone(&socket);
         let clock_sync_running = Arc::clone(&running);
         let clock_sync_remote = remote_addr_parsed.unwrap();
@@ -1345,20 +1379,22 @@ fn main() -> std::io::Result<()> {
                 .as_millis() as u64;
             
             // Create packet: [type (1 byte)][seq_num (8 bytes)][timestamp (8 bytes)][data]
-            let mut packet = Vec::with_capacity(1024);
+            let mut packet = Vec::with_capacity(17 + PACKET_DATA_SIZE);
             packet.push(PACKET_TYPE_DATA); // Packet type: DATA
             packet.extend_from_slice(&seq_num.to_be_bytes());
             packet.extend_from_slice(&timestamp.to_be_bytes());
             
-            // Add lorem ipsum data
-            let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.";
-            let data_size = 500;
-            let mut remaining = data_size;
+            // Add exactly PACKET_DATA_SIZE bytes of data
+            let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.";
+            let lorem_bytes = lorem.as_bytes();
             
-            while remaining > 0 && remaining <= data_size {  // Add bounds check to prevent infinite loop
-                let chunk_size = std::cmp::min(lorem.len(), remaining);
-                packet.extend_from_slice(&lorem.as_bytes()[0..chunk_size]);
-                remaining -= chunk_size;
+            // Create exactly PACKET_DATA_SIZE bytes of payload data
+            let mut data_added = 0;
+            while data_added < PACKET_DATA_SIZE {
+                let remaining = PACKET_DATA_SIZE - data_added;
+                let chunk_size = std::cmp::min(lorem_bytes.len(), remaining);
+                packet.extend_from_slice(&lorem_bytes[0..chunk_size]);
+                data_added += chunk_size;
             }
 
             match sender_socket.send_to(&packet, sender_remote) {
@@ -1440,6 +1476,8 @@ fn main() -> std::io::Result<()> {
     let csv_path_recv = csv_file.clone();
     let receiver_receive_only = receive_only;
     let receiver_clock_sync_interval = clock_sync_interval;
+    let receiver_interval_latency = interval_latency_mode;
+    let receiver_raw_latency = raw_latency_writer.clone();
     
     let receiver_handle = thread::spawn(move || {
         let mut buf = [0; 2048];
@@ -1447,6 +1485,8 @@ fn main() -> std::io::Result<()> {
         // Track source addresses for time sync in receive-only mode
         let mut known_sources: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
         let mut last_time_sync_attempt = std::collections::HashMap::<SocketAddr, Instant>::new();
+        // For alternative latency calculation (inter-arrival based)
+        let mut last_arrival_ms: Option<u64> = None;
 
         // Set socket to non-blocking mode
         receiver_socket.set_nonblocking(true).expect("Failed to set non-blocking mode");
@@ -1474,32 +1514,60 @@ fn main() -> std::io::Result<()> {
                                     .expect("Time went backwards")
                                     .as_millis() as u64;
                                 
-                                // Calculate latency based on timestamps
+                                // Calculate latency
                                 let mut latency_ms = None;
+
+                                // Decide which latency method to use: explicit interval-latency OR fallback when clock sync is disabled
+                                let use_interval_based = receiver_interval_latency || receiver_clock_sync_interval == 0;
                                 
-                                // Check if we have valid clock synchronization
-                                let clock_sync_info = match receiver_clock_sync.lock() {
-                                    Ok(clock_guard) => clock_guard.clone(),
-                                    Err(_) => ClockSync::new(), // Use default if lock fails
-                                };
-                                if clock_sync_info.is_valid() {
-                                    // Convert remote timestamp to local time using our offset
-                                    let adjusted_remote_time = clock_sync_info.remote_to_local(remote_send_time);
-                                    
-                                    // Calculate one-way latency
-                                    if current_time >= adjusted_remote_time {
-                                        let one_way_latency = current_time - adjusted_remote_time;
-                                        latency_ms = Some(one_way_latency as f64);
+                                if use_interval_based {
+                                    // Alternative mode: latency = max(0, inter-arrival - configured interval)
+                                    if let Some(last) = last_arrival_ms {
+                                        let inter_arrival = current_time.saturating_sub(last);
+                                        let diff = inter_arrival as i64 - interval as i64;
+                                        let alt_latency = if diff < 0 { 0.0 } else { diff as f64 };
+                                        latency_ms = Some(alt_latency);
                                         
-                                        // Update latency statistics with error handling
-                                        match receiver_latency.lock() {
-                                            Ok(mut latency_stats) => {
-                                                latency_stats.add_sample(one_way_latency as f64);
-                                            },
-                                            Err(_) => {
-                                                // Continue without updating latency stats if lock fails
+                                        // Update latency statistics
+                                        if let Ok(mut latency_stats) = receiver_latency.lock() {
+                                            latency_stats.add_sample(alt_latency);
+                                        }
+                                    }
+                                    // Update last arrival for next calculation
+                                    last_arrival_ms = Some(current_time);
+                                } else {
+                                    // Timestamp/clock-sync based one-way latency
+                                    // Check if we have valid clock synchronization
+                                    let clock_sync_info = match receiver_clock_sync.lock() {
+                                        Ok(clock_guard) => clock_guard.clone(),
+                                        Err(_) => ClockSync::new(), // Use default if lock fails
+                                    };
+                                    if clock_sync_info.is_valid() {
+                                        // Convert remote timestamp to local time using our offset
+                                        let adjusted_remote_time = clock_sync_info.remote_to_local(remote_send_time);
+                                        
+                                        // Calculate one-way latency
+                                        if current_time >= adjusted_remote_time {
+                                            let one_way_latency = current_time - adjusted_remote_time;
+                                            latency_ms = Some(one_way_latency as f64);
+                                            
+                                            // Update latency statistics with error handling
+                                            match receiver_latency.lock() {
+                                                Ok(mut latency_stats) => {
+                                                    latency_stats.add_sample(one_way_latency as f64);
+                                                },
+                                                Err(_) => {
+                                                    // Continue without updating latency stats if lock fails
+                                                }
                                             }
                                         }
+                                    }
+                                }
+                                
+                                // Write raw latency sample if enabled and we have a value
+                                if let (Some(lat), Some(ref writer)) = (latency_ms, receiver_raw_latency.as_ref()) {
+                                    if let Ok(mut f) = writer.lock() {
+                                        let _ = writeln!(f, "{},{},{:.3},{}", current_time, seq_num, lat, if use_interval_based { "interval" } else { "timestamp" });
                                     }
                                 }
                                 
@@ -1526,7 +1594,7 @@ fn main() -> std::io::Result<()> {
                                 
                                 // In receive-only mode, initiate time sync with sources that send us data
                                 // This is needed to establish clock synchronization for latency calculation
-                                if receiver_receive_only {
+                                if receiver_receive_only && !receiver_interval_latency && receiver_clock_sync_interval > 0 {
                                     // Track this source and potentially initiate time sync
                                     if !known_sources.contains(&src) {
                                         known_sources.insert(src);
@@ -1589,18 +1657,21 @@ fn main() -> std::io::Result<()> {
                                 }
                             },
                             
+
                             PACKET_TYPE_TIME_SYNC if size >= 9 => {
                                 // Extract timestamp (T1)
                                 let mut t1_bytes = [0u8; 8];
                                 t1_bytes.copy_from_slice(&buf[1..9]);
                                 let t1 = u64::from_be_bytes(t1_bytes);
                                 
+
                                 // Send time sync response with timestamps T1, T2, T3
                                 if let Err(e) = send_time_sync_response(&receiver_socket, t1, &src) {
                                     eprintln!("Failed to send time sync response: {e}");
                                 }
                             },
                             
+
                             PACKET_TYPE_TIME_SYNC_RESP if size >= 25 => {
                                 // Extract timestamps (T1, T2, T3)
                                 let mut t1_bytes = [0u8; 8];
@@ -1642,6 +1713,7 @@ fn main() -> std::io::Result<()> {
                                 }
                             },
                             
+
                             PACKET_TYPE_TERMINATE => {
                                 // Received terminate packet, initiate clean shutdown
                                 println!("\nReceived termination signal from remote side...");
@@ -1659,6 +1731,7 @@ fn main() -> std::io::Result<()> {
                                                 stats_guard.update_clock_sync(&clock_guard);
                                             }
                                             
+
                                             let _ = save_final_stats(
                                                 &stats_guard, 
                                                 json_path_recv.as_deref(),
@@ -1675,6 +1748,7 @@ fn main() -> std::io::Result<()> {
                                 return; // Exit receiver thread gracefully
                             },
                             
+
                             // Sync packets are handled in the sync thread
                             _ => {}
                         }
@@ -1763,7 +1837,7 @@ fn main() -> std::io::Result<()> {
                     if latency_guard.samples_count > 0 {
                         latency_guard.get_stats_string()
                     } else {
-                        "No latency data yet".to_string()
+                        if interval_latency_mode || clock_sync_interval == 0 { "No inter-arrival latency data yet".to_string() } else { "No latency data yet".to_string() }
                     }
                 },
                 Err(_) => "Latency stats unavailable".to_string(),
@@ -1788,11 +1862,15 @@ fn main() -> std::io::Result<()> {
                 println!("{}", "-".repeat(80));
                 
                 // Clock sync status
-                println!("Clock Sync: Offset: {}ms, Quality: {}, Samples: {}/{}", 
-                        clock_sync_info.offset_ms,
-                        clock_sync_info.get_quality_string(),
-                        clock_sync_info.sync_responses_received,
-                        clock_sync_info.sync_packets_sent);
+                if clock_sync_interval > 0 {
+                    println!("Clock Sync: Offset: {}ms, Quality: {}, Samples: {}/{}", 
+                            clock_sync_info.offset_ms,
+                            clock_sync_info.get_quality_string(),
+                            clock_sync_info.sync_responses_received,
+                            clock_sync_info.sync_packets_sent);
+                } else {
+                    println!("Clock Sync: disabled");
+                }
                 
                 // Packets row
                 println!("Packets:  Sent: {}  Received: {}  Lost: {} ({:.1}%)", 
@@ -1860,7 +1938,11 @@ fn main() -> std::io::Result<()> {
                 };
                 
                 println!("Status:   {export_status}    Press Ctrl+C to exit");
-                println!("Send interval: {interval} ms  Clock sync interval: {clock_sync_interval} sec  Export interval: {export_interval_clone} sec");
+                if clock_sync_interval > 0 {
+                    println!("Send interval: {interval} ms  Clock sync interval: {clock_sync_interval} sec  Export interval: {export_interval_clone} sec");
+                } else {
+                    println!("Send interval: {interval} ms  Clock sync: disabled  Export interval: {export_interval_clone} sec");
+                }
                 
                 let _ = stdout.flush();
             }
